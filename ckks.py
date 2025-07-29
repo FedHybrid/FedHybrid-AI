@@ -177,3 +177,62 @@ recovered_sub = decoded_sub[[0, 2]] / Delta
 print("\n===== 복원된 뺄셈 슬롯 =====")
 print("recovered_sub:", recovered_sub)
 print("평문 뺄셈 결과:", z1 - z2)
+
+def decrypt(c0, c1, s, Delta, N):
+    """
+    CKKS 복호화: 
+      1) 다항식 복호화 (레이어 1)
+         dec_poly = c0(x) + mod_x4_plus_1(c1(x) * s(x))
+      2) IDFT → 슬롯 복원
+         m_vals = ckks_idft(dec_poly, N)
+      3) Δ 역스케일링
+         return m_vals / Δ
+    """
+    # 1) 다항식 복호화
+    dec_poly = c0 + mod_x4_plus_1(np.convolve(c1, s))
+    # 2) 슬롯 벡터 복원
+    m_vals = ckks_idft(dec_poly, N)
+    # 3) 스케일 역전
+    return m_vals / Delta
+
+def batch_encrypt(m_coeffs, batch_size=4):
+    """
+    큰 벡터를 배치로 나누어 CKKS 암호화 수행
+    """
+    n = len(m_coeffs)
+    num_batches = (n + batch_size - 1) // batch_size
+    
+    c0_list = []
+    c1_list = []
+    
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, n)
+        
+        # 배치 크기에 맞게 패딩
+        batch = np.zeros(batch_size, dtype=np.complex128)
+        batch[:end_idx-start_idx] = m_coeffs[start_idx:end_idx]
+        
+        # CKKS 암호화
+        c0, c1 = encrypt(batch)
+        c0_list.append(c0)
+        c1_list.append(c1)
+    
+    return c0_list, c1_list
+
+def batch_decrypt(c0_list, c1_list, original_size, batch_size=4):
+    """
+    배치로 암호화된 데이터를 복호화하여 원래 크기로 복원
+    """
+    decrypted_parts = []
+    
+    for c0, c1 in zip(c0_list, c1_list):
+        # CKKS 복호화
+        decrypted = decrypt(c0, c1, s, Delta, batch_size)
+        decrypted_parts.append(decrypted)
+    
+    # 모든 배치를 연결
+    full_decrypted = np.concatenate(decrypted_parts)
+    
+    # 원래 크기로 잘라내기
+    return full_decrypted[:original_size]
