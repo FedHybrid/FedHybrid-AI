@@ -6,7 +6,7 @@
 
 FedHybrid-AI는 분산 학습(Federated Learning)과 인공지능을 결합한 혁신적인 시스템입니다. 특히 **FedHB (Federated Hybrid Boost)** 알고리즘을 구현하여 통신 효율성과 학습 성능을 동시에 향상시키는 것을 목표로 합니다.
 
-## 🚀 주요 기능
+## 주요 기능
 
 ### 1. **FedHB (Federated Hybrid Boost) 알고리즘**
 - **적응형 가지치기 (Adaptive Pruning)**: 모델 크기 최적화
@@ -46,7 +46,7 @@ FedHybrid-AI/
 └── README.md            # 프로젝트 문서
 ```
 
-## 🛠️ 설치 및 실행
+## 설치 및 실행
 
 ### 1. 환경 설정
 ```bash
@@ -83,7 +83,7 @@ python FedHBClient.py
 python FedHB.py
 ```
 
-## 🔧 주요 컴포넌트
+## 주요 컴포넌트
 
 ### **FedHB.py**
 - **SimpleCNN**: 경량화된 CNN 모델
