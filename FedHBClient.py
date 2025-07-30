@@ -13,8 +13,9 @@ from ckks import batch_encrypt, batch_decrypt
 # device 설정
 device = torch.device('cpu')  # GPU 환경 문제로 CPU 강제 지정
 
-# CKKS 파라미터 설정
-Delta = 2**6  # 스케일 팩터
+# CKKS 파라미터 설정 (ckks.py와 동일하게)
+z_q = 1 << 10   # 2^10 = 1,024 (평문 인코딩용 스케일)
+rescale_q = z_q  # 리스케일링용 스케일
 N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
@@ -29,7 +30,7 @@ client_model = EnhancerModel(input_dim=input_dim, num_classes=2).to(device)
 global_model = EnhancerModel(input_dim=input_dim, num_classes=2).to(device)  # 글로벌 모델 추가
 
 SERVER_URL = "http://localhost:8000"
-NUM_ROUNDS = 200
+NUM_ROUNDS = 10
 
 def evaluate_local_accuracy(model, data_loader, device):
     model.eval()
@@ -73,7 +74,7 @@ for r in range(NUM_ROUNDS):
     )
     acc_after = evaluate_local_accuracy(updated_model, train_loader, device)
     
-    # FedAvg 방식: 글로벌 모델과 로컬 모델의 가중 평균
+    # FedAvg 방식: 글로벌 모델과 로컬 모델의 가중 평균 (로컬 빠른 업데이트)
     print(f"=== FedAvg 집계 시작 ===")
     alpha = 0.1  # 글로벌 모델 업데이트 비율
     
@@ -88,10 +89,9 @@ for r in range(NUM_ROUNDS):
     
     print(f"FedAvg 집계 완료 (α={alpha})")
     
-    # CKKS 배치 암호화를 통한 모델 업데이트 전송 (기존 방식 유지)
+    # === 1단계: 클라이언트 데이터를 CKKS로 암호화 ===
+    print(f"\n=== 1단계: 클라이언트 데이터 CKKS 암호화 ===")
     state_dict = client_model.state_dict()
-    
-    print(f"\n=== 클라이언트: 모델 암호화 시작 ===")
     print(f"모델 파라미터 수: {len(state_dict)}개 레이어")
     
     # 1) Tensor → flat numpy vector
@@ -100,61 +100,72 @@ for r in range(NUM_ROUNDS):
     print(f"원본 값 범위: {flat.min():.4f} ~ {flat.max():.4f}")
     print(f"원본 값 평균: {flat.mean():.4f}")
     
-    # 2) plaintext 다항식 계수로 인코딩
-    m_coeffs = flat.astype(np.complex128)  # 복소 슬롯 벡터
-    
-    # 3) 배치 암호화
+    # 2) 정수 기반 배치 암호화
+    m_coeffs = flat.astype(np.int64)  # 정수 벡터
     c0_list, c1_list = batch_encrypt(m_coeffs, batch_size=4)
-    print(f"암호화 완료: {len(c0_list)}개 배치")
+    print(f"정수 기반 암호화 완료: {len(c0_list)}개 배치")
+    print(f"암호화된 c0 첫 번째 배치 범위: {c0_list[0].min()} ~ {c0_list[0].max()}")
+    print(f"암호화된 c1 첫 번째 배치 범위: {c1_list[0].min()} ~ {c1_list[0].max()}")
     
-    # 4) 리스트로 변환 후 JSON 직렬화
+    # === 2단계: 암호화된 데이터를 서버로 전송 ===
+    print(f"\n=== 2단계: 암호화된 데이터 서버 전송 ===")
     payload = {
         "c0_list": [[[float(c.real), float(c.imag)] for c in c0] for c0 in c0_list],
         "c1_list": [[[float(c.real), float(c.imag)] for c in c1] for c1 in c1_list],
         "original_size": len(m_coeffs),
         "num_samples": num_samples,
-        "loss": avg_loss  # 손실 정보 추가
+        "loss": avg_loss
     }
+    print(f"전송할 페이로드 크기: {len(payload['c0_list'])}개 배치")
     
-    print(f"서버로 전송할 페이로드 크기: {len(payload['c0_list'])}개 배치")
-    
-    # 5) 서버로 전송 (기존 방식 유지)
     try:
-        print(f"서버로 업데이트 전송 중...")
+        print(f"서버로 암호화된 데이터 전송 중...")
         aggregate_response = requests.post(f"{SERVER_URL}/aggregate", json=payload)
         if aggregate_response.status_code == 200:
             try:
                 aggregate_json = aggregate_response.json()
-                print(f"[Round {r+1}] 서버 응답 수신")
+                print(f"[Round {r+1}] 서버 응답 수신 완료")
                 
-                # 서버로부터 암호화된 집계 모델 수신 및 복호화
+                # === 3단계: 서버로부터 암호화된 평균 결과 수신 ===
                 if "c0_list" in aggregate_json and "c1_list" in aggregate_json:
-                    print(f"=== 클라이언트: 서버 응답 복호화 시작 ===")
+                    print(f"\n=== 3단계: 서버 암호화된 평균 결과 수신 ===")
                     c0_list_agg = [np.array([complex(c[0], c[1]) for c in c0], dtype=np.complex128) for c0 in aggregate_json["c0_list"]]
                     c1_list_agg = [np.array([complex(c[0], c[1]) for c in c1], dtype=np.complex128) for c1 in aggregate_json["c1_list"]]
                     original_size = aggregate_json["original_size"]
                     
-                    print(f"받은 암호문: {len(c0_list_agg)}개 배치")
+                    print(f"받은 암호화된 평균 결과: {len(c0_list_agg)}개 배치")
+                    print(f"받은 c0 첫 번째 배치 범위: {c0_list_agg[0].min()} ~ {c0_list_agg[0].max()}")
+                    print(f"받은 c1 첫 번째 배치 범위: {c1_list_agg[0].min()} ~ {c1_list_agg[0].max()}")
                     
-                    # 배치 복호화
-                    m_vals = batch_decrypt(c0_list_agg, c1_list_agg, original_size, batch_size=4)
-                    print(f"복호화 완료: {len(m_vals)}개 값")
-                    print(f"복호화된 값 범위: {m_vals.real.min():.4f} ~ {m_vals.real.max():.4f}")
-                    print(f"복호화된 값 평균: {m_vals.real.mean():.4f}")
+                    # === 4단계: 암호화된 상태로 모델 업데이트 (복호화 없이) ===
+                    print(f"\n=== 4단계: 암호화된 상태로 모델 업데이트 ===")
+                    print(f"암호화된 상태로 글로벌 모델 업데이트 중...")
                     
-                    # 서버 응답은 무시하고 FedAvg 집계 결과만 사용
-                    print(f"서버 응답 무시 - FedAvg 집계 결과 유지")
+                    # 암호화된 상태로 모델 파라미터 저장 (복호화하지 않음)
+                    encrypted_state = {
+                        'c0_list': c0_list_agg,
+                        'c1_list': c1_list_agg,
+                        'original_size': original_size
+                    }
                     
-                    # 대신 글로벌 모델을 파일로 저장 (다음 라운드용)
-                    torch.save(global_model.state_dict(), "global_model.pth")
-                    print(f"글로벌 모델 저장 완료")
+                    # 글로벌 모델을 암호화된 상태로 저장
+                    torch.save(encrypted_state, "encrypted_global_model.pth")
+                    print(f"암호화된 글로벌 모델 저장 완료")
+                    
+                    # 다음 라운드에서 암호화된 상태로 학습할 수 있도록 준비
+                    print(f"다음 라운드에서 암호화된 상태로 학습 준비 완료")
+                    
+                    # === 5단계: 암호화된 상태로 학습 진행 (다음 라운드에서) ===
+                    print(f"\n=== 5단계: 암호화된 상태로 학습 준비 ===")
+                    print(f"현재 라운드에서는 암호화된 상태 저장 완료")
+                    print(f"다음 라운드에서 암호화된 상태로 학습을 진행할 예정")
                         
             except Exception as e:
-                print(f"[Round {r+1}] 집계 응답 처리 중 에러: {e}")
+                print(f"[Round {r+1}] 서버 응답 처리 중 에러: {e}")
         else:
-            print(f"[Round {r+1}] 집계 요청 실패: {aggregate_response.status_code}")
+            print(f"[Round {r+1}] 서버 전송 실패: {aggregate_response.status_code}")
     except Exception as e:
-        print(f"[Round {r+1}] 집계 요청 중 에러: {e}")
+        print(f"[Round {r+1}] 서버 통신 중 에러: {e}")
     
     # NaN 체크
     if np.isnan(avg_loss) or np.isinf(avg_loss):

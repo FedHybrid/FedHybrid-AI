@@ -15,7 +15,8 @@ app = FastAPI()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # CKKS 파라미터 설정 (클라이언트와 동일)
-Delta = 2**6  # 스케일 팩터
+z_q = 1 << 10   # 2^10 = 1,024 (평문 인코딩용 스케일)
+rescale_q = z_q  # 리스케일링용 스케일
 N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
@@ -155,50 +156,52 @@ def predict_and_download():
 async def aggregate(request: UpdateRequest):
     global global_model, updates_buffer, global_accuracies
     
-    print(f"\n=== 서버: 클라이언트 업데이트 수신 ===")
+    print(f"\n=== 서버: 클라이언트 암호화된 데이터 수신 ===")
     print(f"받은 c0_list 길이: {len(request.c0_list)}")
     print(f"받은 c1_list 길이: {len(request.c1_list)}")
     print(f"원본 크기: {request.original_size}")
     print(f"샘플 수: {request.num_samples}")
     
-    # 1) JSON → numpy array
+    # 1) JSON → numpy array (암호화된 상태)
     c0_list = [np.array([complex(c[0], c[1]) for c in c0], dtype=np.complex128) for c0 in request.c0_list]
     c1_list = [np.array([complex(c[0], c[1]) for c in c1], dtype=np.complex128) for c1 in request.c1_list]
     
-    print(f"복호화 시작: {len(c0_list)}개 배치")
+    print(f"암호화된 데이터 변환 완료: {len(c0_list)}개 배치")
+    print(f"첫 번째 배치 c0 범위: {c0_list[0].min()} ~ {c0_list[0].max()}")
+    print(f"첫 번째 배치 c1 범위: {c1_list[0].min()} ~ {c1_list[0].max()}")
     
-    # 2) CKKS 배치 복호화
-    m_vals = batch_decrypt(c0_list, c1_list, request.original_size, batch_size=4)
+    # 2) CKKS 배치 복호화 (필요시에만)
+    # m_vals = batch_decrypt(c0_list, c1_list, request.original_size, batch_size=4)
+    # print(f"복호화 완료: {len(m_vals)}개 값")
+    # print(f"복호화된 값 범위: {m_vals.real.min():.4f} ~ {m_vals.real.max():.4f}")
+    # print(f"복호화된 값 평균: {m_vals.real.mean():.4f}")
     
-    print(f"복호화 완료: {len(m_vals)}개 값")
-    print(f"복호화된 값 범위: {m_vals.real.min():.4f} ~ {m_vals.real.max():.4f}")
-    print(f"복호화된 값 평균: {m_vals.real.mean():.4f}")
+    # 3) 복호화된 벡터 → torch tensor + 원래 모델 shape 복원 (필요시에만)
+    # ptr = 0
+    # unflat_state = {}
+    # for k, v in global_model.state_dict().items():
+    #     numel = v.numel()
+    #     arr = torch.from_numpy(
+    #         m_vals[ptr:ptr+numel].astype(np.float32)
+    #     ).view(v.size())
+    #     unflat_state[k] = arr.to(device)
+    #     ptr += numel
+    #     print(f"파라미터 {k}: shape={v.size()}, 값 범위={arr.min().item():.4f}~{arr.max().item():.4f}")
+    # 
+    # print(f"모델 파라미터 복원 완료: {len(unflat_state)}개 레이어")
     
-    # 3) 복호화된 벡터 → torch tensor + 원래 모델 shape 복원
-    ptr = 0
-    unflat_state = {}
-    for k, v in global_model.state_dict().items():
-        numel = v.numel()
-        arr = torch.from_numpy(
-            m_vals[ptr:ptr+numel].astype(np.float32)
-        ).view(v.size())
-        unflat_state[k] = arr.to(device)
-        ptr += numel
-        print(f"파라미터 {k}: shape={v.size()}, 값 범위={arr.min().item():.4f}~{arr.max().item():.4f}")
-    
-    print(f"모델 파라미터 복원 완료: {len(unflat_state)}개 레이어")
-    
-    # 4) 암호화된 데이터 저장
-    updates_buffer.append({
+    # 4) 암호화된 데이터 저장 (기존 버퍼 초기화 후 새로 추가)
+    updates_buffer = [{
         'c0_list': c0_list,
         'c1_list': c1_list,
         'num_samples': request.num_samples,
         'loss': request.loss
-    })
-    print(f"업데이트 버퍼 크기: {len(updates_buffer)}/{EXPECTED_CLIENTS}")
+    }]
+    print(f"업데이트 버퍼 초기화 및 새 업데이트 추가: {len(updates_buffer)}/{EXPECTED_CLIENTS}")
     
     if len(updates_buffer) >= EXPECTED_CLIENTS:
-        print(f"\n=== 서버: 암호화된 상태에서 집계 시작 ===")
+        print(f"\n=== 서버: 암호화된 상태에서 평균 계산 시작 ===")
+        print(f"현재 버퍼에 {len(updates_buffer)}개 업데이트 있음")
         
         # 손실 기반 가중치 계산
         client_weights = []
@@ -213,47 +216,65 @@ async def aggregate(request: UpdateRequest):
         
         print(f"클라이언트 가중치: {[f'{w:.3f}' for w in client_weights]}")
         
-        # 암호화된 상태에서 가중 평균 집계
-        from ckks import ckks_add
+        # 암호화된 상태에서 가중 평균 계산 (복호화 없이)
+        from ckks import ckks_add, ckks_scale
         
-        # 첫 번째 클라이언트의 암호문을 기준으로 시작
+        # 첫 번째 클라이언트의 암호문을 가중치로 스케일링
         first_update = updates_buffer[0]
-        c0_list_agg = first_update['c0_list']
-        c1_list_agg = first_update['c1_list']
         weight = client_weights[0]
+        c0_list_agg = []
+        c1_list_agg = []
+        
+        print(f"클라이언트 손실: {first_update['loss']:.4f}")
+        print(f"적용할 가중치: {weight:.4f}")
+        
+        for c0, c1 in zip(first_update['c0_list'], first_update['c1_list']):
+            c0_scaled, c1_scaled = ckks_scale((c0, c1), weight)
+            c0_list_agg.append(c0_scaled)
+            c1_list_agg.append(c1_scaled)
         
         print(f"첫 번째 클라이언트 (가중치: {weight:.3f})로 시작")
         
-        # 단일 클라이언트인 경우 그대로 반환 (집계 불필요)
+        # 단일 클라이언트인 경우 가중치만 적용
         if len(updates_buffer) == 1:
-            print(f"단일 클라이언트: 집계 없이 그대로 반환")
+            print(f"단일 클라이언트: 가중치 {weight:.3f} 적용 완료")
         else:
-            # 나머지 클라이언트들과 암호화된 상태에서 집계
+            # 나머지 클라이언트들과 암호화된 상태에서 가중 평균 계산
             for i, update in enumerate(updates_buffer[1:], 1):
                 weight = client_weights[i]
-                print(f"클라이언트 {i+1} (가중치: {weight:.3f})와 집계")
+                print(f"클라이언트 {i+1} (가중치: {weight:.3f})와 가중 평균 계산")
                 
-                # 각 배치별로 암호화된 덧셈 수행
+                # 각 배치별로 가중치 적용 후 덧셈 수행
                 for j in range(len(c0_list_agg)):
+                    # 가중치 적용
+                    c0_scaled, c1_scaled = ckks_scale((update['c0_list'][j], update['c1_list'][j]), weight)
+                    
                     # 암호화된 덧셈 수행
                     c0_sum, c1_sum = ckks_add(
                         (c0_list_agg[j], c1_list_agg[j]), 
-                        (update['c0_list'][j], update['c1_list'][j])
+                        (c0_scaled, c1_scaled)
                     )
                     c0_list_agg[j] = c0_sum
                     c1_list_agg[j] = c1_sum
         
-        print(f"암호화된 상태에서 집계 완료")
+        print(f"암호화된 상태에서 평균 계산 완료")
+        
+        # 디버깅: 첫 번째 배치의 값 확인
+        if len(c0_list_agg) > 0:
+            first_c0 = c0_list_agg[0]
+            first_c1 = c1_list_agg[0]
+            print(f"평균 계산된 첫 번째 배치 c0 범위: {first_c0.min()} ~ {first_c0.max()}")
+            print(f"평균 계산된 첫 번째 배치 c1 범위: {first_c1.min()} ~ {first_c1.max()}")
         
         updates_buffer.clear()
         
-        # 6) 클라이언트로 암호문 송신 (암호화된 상태 그대로)
+        # 5단계: 클라이언트로 암호화된 평균 결과 전송
         response = {
             "c0_list": [[[float(c.real), float(c.imag)] for c in c0] for c0 in c0_list_agg],
             "c1_list": [[[float(c.real), float(c.imag)] for c in c1] for c1 in c1_list_agg],
             "original_size": request.original_size
         }
-        print(f"클라이언트로 암호화된 집계 결과 전송 완료")
+        print(f"클라이언트로 암호화된 평균 결과 전송 완료")
         return response
     
     return {"status": "waiting"}
