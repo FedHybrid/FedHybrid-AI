@@ -1,13 +1,15 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 import torch
-from model import EnhancerModel
+from model import EnhancerModel, load_diabetes_data
 from aggregation import CommunicationEfficientFedHB
 import uvicorn
 import os
 import numpy as np
 from ckks import batch_encrypt, batch_decrypt
 from pydantic import BaseModel
+import pandas as pd
+from torch.utils.data import DataLoader
 
 app = FastAPI()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -38,6 +40,7 @@ class UpdateRequest(BaseModel):
     c1_list: list
     original_size: int
     num_samples: int
+    loss: float
 
 @app.get("/get_model")
 def get_model():
@@ -47,6 +50,106 @@ def get_model():
         # 파일이 없으면 빈 모델을 저장하고 반환
         torch.save(global_model.state_dict(), "global_model.pth")
         return FileResponse("global_model.pth", media_type="application/octet-stream", filename="global_model.pth")
+
+@app.get("/predict_and_download")
+def predict_and_download():
+    """
+    학습된 모델로 전체 데이터셋에 대해 예측을 수행하고 
+    원본 데이터에 예측 결과를 추가한 엑셀 파일을 생성하여 다운로드
+    """
+    print(f"\n=== 서버: 예측 및 엑셀 파일 생성 시작 ===")
+    
+    # 1. 원본 데이터 로드
+    try:
+        df = pd.read_csv('diabetic_data.csv')
+        print(f"원본 데이터 로드 완료: {len(df)}행, {len(df.columns)}열")
+    except Exception as e:
+        print(f"데이터 로드 실패: {e}")
+        return {"error": "데이터 로드 실패"}
+    
+    # 2. 데이터 전처리 (클라이언트와 동일한 방식)
+    try:
+        # 클라이언트와 동일한 전처리 적용
+        drop_cols = ['encounter_id', 'patient_nbr']
+        df_processed = df.drop(columns=drop_cols)
+        df_processed['readmitted'] = df_processed['readmitted'].map(lambda x: 0 if x == 'NO' else 1)
+        
+        # 숫자형 컬럼만 feature로 사용
+        numeric_cols = df_processed.select_dtypes(include=['int64', 'float64']).columns.tolist()
+        numeric_cols = [col for col in numeric_cols if col != 'readmitted']
+        
+        X = df_processed[numeric_cols].values.astype('float32')
+        print(f"전처리 완료: {X.shape}")
+    except Exception as e:
+        print(f"전처리 실패: {e}")
+        return {"error": "데이터 전처리 실패"}
+    
+    # 3. 모델 예측
+    try:
+        global_model.eval()
+        predictions = []
+        probabilities = []
+        
+        # 배치 단위로 예측 수행
+        batch_size = 1000
+        for i in range(0, len(X), batch_size):
+            batch_X = X[i:i+batch_size]
+            batch_tensor = torch.from_numpy(batch_X).to(device)
+            
+            with torch.no_grad():
+                outputs = global_model(batch_tensor)
+                probs = torch.softmax(outputs, dim=1)
+                preds = torch.argmax(outputs, dim=1)
+                
+                predictions.extend(preds.cpu().numpy())
+                probabilities.extend(probs.cpu().numpy())
+        
+        predictions = np.array(predictions)
+        probabilities = np.array(probabilities)
+        
+        print(f"예측 완료: {len(predictions)}개 샘플")
+        print(f"예측 결과 분포: {np.bincount(predictions)}")
+    except Exception as e:
+        print(f"예측 실패: {e}")
+        return {"error": "모델 예측 실패"}
+    
+    # 4. 원본 데이터에 예측 결과 추가
+    try:
+        df_result = df.copy()
+        df_result['predicted_readmission'] = predictions
+        df_result['readmission_probability'] = probabilities[:, 1]  # 재입원 확률
+        df_result['prediction_confidence'] = np.max(probabilities, axis=1)
+        
+        # 예측 결과 해석 추가
+        df_result['prediction_interpretation'] = df_result['predicted_readmission'].map({
+            0: '재입원 위험 낮음',
+            1: '재입원 위험 높음'
+        })
+        
+        print(f"결과 데이터 생성 완료: {len(df_result)}행, {len(df_result.columns)}열")
+    except Exception as e:
+        print(f"결과 데이터 생성 실패: {e}")
+        return {"error": "결과 데이터 생성 실패"}
+    
+    # 5. 엑셀 파일 저장
+    try:
+        output_filename = "diabetic_predictions.xlsx"
+        df_result.to_excel(output_filename, index=False, engine='openpyxl')
+        print(f"엑셀 파일 저장 완료: {output_filename}")
+    except Exception as e:
+        print(f"엑셀 파일 저장 실패: {e}")
+        return {"error": "엑셀 파일 저장 실패"}
+    
+    # 6. 파일 다운로드 응답
+    try:
+        return FileResponse(
+            output_filename, 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=output_filename
+        )
+    except Exception as e:
+        print(f"파일 다운로드 응답 실패: {e}")
+        return {"error": "파일 다운로드 실패"}
 
 @app.post("/aggregate")
 async def aggregate(request: UpdateRequest):
@@ -85,44 +188,72 @@ async def aggregate(request: UpdateRequest):
     
     print(f"모델 파라미터 복원 완료: {len(unflat_state)}개 레이어")
     
-    # 4) 집계 (평균)
-    updates_buffer.append((unflat_state, request.num_samples))
+    # 4) 암호화된 데이터 저장
+    updates_buffer.append({
+        'c0_list': c0_list,
+        'c1_list': c1_list,
+        'num_samples': request.num_samples,
+        'loss': request.loss
+    })
     print(f"업데이트 버퍼 크기: {len(updates_buffer)}/{EXPECTED_CLIENTS}")
     
     if len(updates_buffer) >= EXPECTED_CLIENTS:
-        print(f"\n=== 서버: 모델 집계 시작 ===")
-        # state_dict 평균
-        total_samples = sum(samples for _, samples in updates_buffer)
-        avg_state = {}
-        for k in unflat_state.keys():
-            weighted_sum = torch.zeros_like(unflat_state[k])
-            for state_dict, samples in updates_buffer:
-                weight = samples / total_samples
-                weighted_sum += weight * state_dict[k]
-            avg_state[k] = weighted_sum
-            print(f"집계된 {k}: 평균값={weighted_sum.mean().item():.4f}")
+        print(f"\n=== 서버: 암호화된 상태에서 집계 시작 ===")
         
-        global_model.load_state_dict(avg_state)
+        # 손실 기반 가중치 계산
+        client_weights = []
+        for update in updates_buffer:
+            # 손실이 낮을수록 높은 가중치
+            weight = 1.0 / (1.0 + update['loss'])
+            client_weights.append(weight)
+        
+        # 가중치 정규화
+        total_weight = sum(client_weights)
+        client_weights = [w / total_weight for w in client_weights]
+        
+        print(f"클라이언트 가중치: {[f'{w:.3f}' for w in client_weights]}")
+        
+        # 암호화된 상태에서 가중 평균 집계
+        from ckks import ckks_add
+        
+        # 첫 번째 클라이언트의 암호문을 기준으로 시작
+        first_update = updates_buffer[0]
+        c0_list_agg = first_update['c0_list']
+        c1_list_agg = first_update['c1_list']
+        weight = client_weights[0]
+        
+        print(f"첫 번째 클라이언트 (가중치: {weight:.3f})로 시작")
+        
+        # 단일 클라이언트인 경우 그대로 반환 (집계 불필요)
+        if len(updates_buffer) == 1:
+            print(f"단일 클라이언트: 집계 없이 그대로 반환")
+        else:
+            # 나머지 클라이언트들과 암호화된 상태에서 집계
+            for i, update in enumerate(updates_buffer[1:], 1):
+                weight = client_weights[i]
+                print(f"클라이언트 {i+1} (가중치: {weight:.3f})와 집계")
+                
+                # 각 배치별로 암호화된 덧셈 수행
+                for j in range(len(c0_list_agg)):
+                    # 암호화된 덧셈 수행
+                    c0_sum, c1_sum = ckks_add(
+                        (c0_list_agg[j], c1_list_agg[j]), 
+                        (update['c0_list'][j], update['c1_list'][j])
+                    )
+                    c0_list_agg[j] = c0_sum
+                    c1_list_agg[j] = c1_sum
+        
+        print(f"암호화된 상태에서 집계 완료")
+        
         updates_buffer.clear()
         
-        print(f"=== 서버: 재암호화 시작 ===")
-        # 5) 재암호화 (평균 모델)
-        flat_avg = np.concatenate([
-            avg_state[k].cpu().numpy().flatten() for k in avg_state
-        ])
-        m_avg = flat_avg.astype(np.complex128)
-        c0_list_agg, c1_list_agg = batch_encrypt(m_avg, batch_size=4)
-        
-        print(f"재암호화 완료: {len(c0_list_agg)}개 배치")
-        print(f"집계된 모델 크기: {len(m_avg)}")
-        
-        # 6) 클라이언트로 암호문 송신
+        # 6) 클라이언트로 암호문 송신 (암호화된 상태 그대로)
         response = {
             "c0_list": [[[float(c.real), float(c.imag)] for c in c0] for c0 in c0_list_agg],
             "c1_list": [[[float(c.real), float(c.imag)] for c in c1] for c1 in c1_list_agg],
-            "original_size": len(m_avg)
+            "original_size": request.original_size
         }
-        print(f"클라이언트로 응답 전송 완료")
+        print(f"클라이언트로 암호화된 집계 결과 전송 완료")
         return response
     
     return {"status": "waiting"}

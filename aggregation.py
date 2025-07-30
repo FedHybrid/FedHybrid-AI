@@ -38,20 +38,38 @@ class CommunicationEfficientFedHB:
         global_model.load_state_dict(agg)
         return global_model
 
-    def server_aggregate_full(self, global_model, updates, use_momentum=False, momentum_beta=0.9, use_pruning=False):
+    def server_aggregate_full(self, global_model, updates, use_momentum=True, momentum_beta=0.9, use_pruning=True):
         # updates: [{'state_dict': ..., 'num_samples': ...}, ...]
         total_samples = sum(u['num_samples'] for u in updates)
         new_state = {}
         prev_state = global_model.state_dict()
+        
+        # 클라이언트 가중치 계산 (손실 기반)
+        client_weights = []
+        for u in updates:
+            # 손실이 낮을수록 높은 가중치
+            weight = 1.0 / (1.0 + u.get('loss', 1.0))
+            client_weights.append(weight)
+        
+        # 가중치 정규화
+        total_weight = sum(client_weights)
+        client_weights = [w / total_weight for w in client_weights]
+        
         for key in prev_state.keys():
-            agg_param = sum(u['state_dict'][key] * u['num_samples'] for u in updates) / total_samples
-            # Pruning
+            # 가중 평균 집계
+            agg_param = sum(u['state_dict'][key] * w for u, w in zip(updates, client_weights))
+            
+            # Pruning (더 적극적으로)
             if use_pruning:
-                mask = agg_param.abs() > 0.15
+                threshold = 0.1  # 임계값 낮춤
+                mask = agg_param.abs() > threshold
                 agg_param = agg_param * mask
-            # Momentum
+            
+            # Momentum (더 강하게)
             if use_momentum:
                 agg_param = momentum_beta * prev_state[key] + (1 - momentum_beta) * agg_param
+            
             new_state[key] = agg_param
+        
         global_model.load_state_dict(new_state)
         return global_model 

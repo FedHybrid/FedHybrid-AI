@@ -417,20 +417,21 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
     # 가중 손실 함수 사용
     weighted_criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     
-    # 모델 가중치를 더 나은 초기화로 설정
-    for param in client_model.parameters():
-        if len(param.shape) > 1:  # 가중치 행렬
-            torch.nn.init.xavier_uniform_(param)
-        else:  # 바이어스
-            torch.nn.init.zeros_(param)
+    # 모델 가중치 초기화는 첫 라운드에만 수행
+    if round_idx == 0:
+        for param in client_model.parameters():
+            if len(param.shape) > 1:  # 가중치 행렬
+                torch.nn.init.xavier_uniform_(param)
+            else:  # 바이어스
+                torch.nn.init.zeros_(param)
     
     client_model.train()
-    optimizer = optim.Adam(client_model.parameters(), lr=0.01, weight_decay=1e-4)  # Adam 사용, 학습률 증가
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)  # 학습률 스케줄링
+    optimizer = optim.Adam(client_model.parameters(), lr=0.001, weight_decay=1e-4)  # 학습률 더 감소
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.9)  # 더 자주 스케줄링
     total_loss = 0.0
     total_samples = 0
-    mu = 0.01  # FedProx 파라미터
-    epochs = 10  # 에포크 수 감소
+    mu = 0.01  # FedProx 파라미터 감소 (안정성 향상)
+    epochs = 5  # 에포크 수 감소 (안정성 향상)
     
     # Early stopping 변수
     best_loss = float('inf')
@@ -445,37 +446,50 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
             output = client_model(x)
             loss = weighted_criterion(output, y)  # 가중 손실 사용
             
-            # FedProx (비활성화)
-            if use_fedprox and False:  # FedProx 비활성화
+            # FedProx (일시적 비활성화 - 안정성 향상)
+            if use_fedprox and False:  # 일시적 비활성화
                 prox_loss = 0.0
                 for w, w_t in zip(client_model.parameters(), global_model.parameters()):
                     prox_loss += ((w - w_t.detach()) ** 2).sum()
                 loss += mu * prox_loss
             
-            # Knowledge Distillation (비활성화)
-            if use_kd and False:  # KD 비활성화
+            # Knowledge Distillation (일시적 비활성화 - 안정성 향상)
+            if use_kd and round_idx > 0 and False:  # 일시적 비활성화
                 with torch.no_grad():
                     global_model.eval()
                     temperature = 3.0 * np.exp(-0.1 * round_idx)
                     teacher_probs = torch.softmax(global_model(x) / temperature, dim=1)
                 student_log_probs = torch.log_softmax(output / temperature, dim=1)
                 kd_loss = nn.KLDivLoss(reduction='batchmean')(student_log_probs, teacher_probs)
-                loss = 0.5 * loss + 0.5 * kd_loss
+                loss = 0.8 * loss + 0.2 * kd_loss  # KD 가중치 감소 (안정성 향상)
             
             loss.backward()
             
-            # 그래디언트 클리핑 추가
-            torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=1.0)
+            # NaN 체크
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                print(f"  경고: NaN/Inf 손실 감지, 배치 건너뛰기")
+                continue
+            
+            # 그래디언트 클리핑 강화
+            torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=0.5)
             
             optimizer.step()
             epoch_loss += loss.item() * x.size(0)
             total_samples += x.size(0)
         
-        # 학습률 스케줄링
+        # 학습률 스케줄링 (optimizer.step() 이후에 호출)
         scheduler.step()
         
         # Early stopping 체크
-        avg_epoch_loss = epoch_loss / total_samples
+        if total_samples > 0:
+            avg_epoch_loss = epoch_loss / total_samples
+            if np.isnan(avg_epoch_loss) or np.isinf(avg_epoch_loss):
+                print(f"  경고: NaN/Inf 손실 감지, 학습 중단")
+                break
+        else:
+            print(f"  경고: 유효한 샘플이 없음, 학습 중단")
+            break
+        
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
             patience_counter = 0
@@ -493,7 +507,10 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
         
         total_loss += epoch_loss
     
-    avg_loss = total_loss / total_samples
+    if total_samples > 0:
+        avg_loss = total_loss / total_samples
+    else:
+        avg_loss = float('inf')  # 기본값 설정
     return client_model, avg_loss, epochs, total_samples
 
 def download_global_model():
