@@ -13,6 +13,10 @@ from ckks import batch_encrypt, batch_decrypt
 # device 설정
 device = torch.device('cpu')  # GPU 환경 문제로 CPU 강제 지정
 
+# 클라이언트 설정
+import os
+CLIENT_ID = os.getenv('CLIENT_ID', 'client_1')  # 환경변수로 클라이언트 ID 설정 가능
+
 # CKKS 파라미터 설정 (ckks.py와 동일하게)
 z_q = 1 << 10   # 2^10 = 1,024 (평문 인코딩용 스케일)
 rescale_q = z_q  # 리스케일링용 스케일
@@ -21,8 +25,8 @@ s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
 # 데이터셋 준비 (train/test 분할)
 train_dataset, test_dataset = load_diabetes_data('diabetic_data.csv')
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=0)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=0)
 input_dim = train_dataset.X.shape[1]
 
 # 모델 준비 (EnhancerModel)
@@ -63,15 +67,19 @@ def download_global_model():
     raise RuntimeError("global_model.pth를 정상적으로 다운로드하지 못했습니다.")
 
 for r in range(NUM_ROUNDS):
+    round_start_time = time.time()  # 라운드 시작 시간
     print(f"=== 라운드 {r+1} 시작 ===")
     download_global_model()
     acc_before = evaluate_local_accuracy(client_model, train_loader, device)
     
     # 로컬 학습 수행
+    training_start_time = time.time()
     updated_model, avg_loss, epochs, num_samples = client_update_full(
         client_model, global_model, train_loader, nn.CrossEntropyLoss(), r, device,
         use_kd=False, use_fedprox=False, use_pruning=True  # 일시적 비활성화
     )
+    training_end_time = time.time()
+    training_duration = training_end_time - training_start_time
     acc_after = evaluate_local_accuracy(updated_model, train_loader, device)
     
     # 로컬 학습 완료된 모델을 그대로 사용 (FedAvg 원칙)
@@ -82,6 +90,7 @@ for r in range(NUM_ROUNDS):
     client_model.load_state_dict(updated_model.state_dict())
     
     # === 1단계: 클라이언트 데이터를 CKKS로 암호화 ===
+    encryption_start_time = time.time()
     print(f"\n=== 1단계: 클라이언트 데이터 CKKS 암호화 ===")
     state_dict = client_model.state_dict()
     print(f"모델 파라미터 수: {len(state_dict)}개 레이어")
@@ -95,9 +104,12 @@ for r in range(NUM_ROUNDS):
     # 2) 정수 기반 배치 암호화
     m_coeffs = flat.astype(np.int64)  # 정수 벡터
     c0_list, c1_list = batch_encrypt(m_coeffs, batch_size=4)
+    encryption_end_time = time.time()
+    encryption_duration = encryption_end_time - encryption_start_time
     print(f"정수 기반 암호화 완료: {len(c0_list)}개 배치")
     print(f"암호화된 c0 첫 번째 배치 범위: {c0_list[0].min()} ~ {c0_list[0].max()}")
     print(f"암호화된 c1 첫 번째 배치 범위: {c1_list[0].min()} ~ {c1_list[0].max()}")
+    print(f"암호화 소요 시간: {encryption_duration:.1f}초")
     
     # === 2단계: 암호화된 데이터를 서버로 전송 ===
     print(f"\n=== 2단계: 암호화된 데이터 서버 전송 ===")
@@ -107,18 +119,22 @@ for r in range(NUM_ROUNDS):
         "original_size": len(m_coeffs),
         "num_samples": num_samples,
         "loss": avg_loss,
-        "client_id": f"client_{r+1}",  # 클라이언트 식별자
+        "client_id": CLIENT_ID,  # 클라이언트 식별자
         "round_id": r+1  # 라운드 식별자
     }
     print(f"전송할 페이로드 크기: {len(payload['c0_list'])}개 배치")
     
     try:
+        communication_start_time = time.time()
         print(f"서버로 암호화된 데이터 전송 중...")
         aggregate_response = requests.post(f"{SERVER_URL}/aggregate", json=payload)
         if aggregate_response.status_code == 200:
             try:
                 aggregate_json = aggregate_response.json()
+                communication_end_time = time.time()
+                communication_duration = communication_end_time - communication_start_time
                 print(f"[Round {r+1}] 서버 응답 수신 완료")
+                print(f"통신 소요 시간: {communication_duration:.1f}초")
                 
                 # === 3단계: 서버로부터 암호화된 평균 결과 수신 ===
                 if "c0_list" in aggregate_json and "c1_list" in aggregate_json:
@@ -170,6 +186,16 @@ for r in range(NUM_ROUNDS):
     
     # 집계된 글로벌 모델로 테스트셋 정확도 평가
     global_acc = evaluate_local_accuracy(client_model, test_loader, device)
+    
+    # 라운드 소요 시간 계산
+    round_end_time = time.time()
+    round_duration = round_end_time - round_start_time
+    
     print(f"[Round {r+1}] 글로벌 모델 로컬 데이터 정확도(학습 전): {acc_before:.2f}% | 로컬 모델 정확도(학습 후): {acc_after:.2f}%")
     print(f"[Round {r+1}] 글로벌 모델 테스트셋 정확도: {global_acc:.2f}%")
+    print(f"[Round {r+1}] 시간 분석:")
+    print(f"  - 로컬 학습: {training_duration:.1f}초")
+    print(f"  - 암호화: {encryption_duration:.1f}초")
+    print(f"  - 통신: {communication_duration:.1f}초")
+    print(f"  - 전체 라운드: {round_duration:.1f}초")
     print(f"=== 라운드 {r+1} 종료 ===\n") 
