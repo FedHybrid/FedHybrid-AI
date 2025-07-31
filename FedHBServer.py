@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 import torch
-from model import EnhancerModel, load_diabetes_data
+from improved_model import ImprovedEnhancerModel, load_improved_diabetes_data
 from aggregation import CommunicationEfficientFedHB
 import uvicorn
 import os
@@ -23,11 +23,11 @@ rescale_q = z_q  # 리스케일링용 스케일
 N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
-# input_dim을 클라이언트와 반드시 동일하게 명시 (예: 11)
-input_dim = 11
+# input_dim을 클라이언트와 반드시 동일하게 명시 (개선된 모델은 8개 특성 사용)
+input_dim = 8
 num_classes = 2
 
-global_model = EnhancerModel(input_dim=input_dim, num_classes=num_classes).to(device)
+global_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=num_classes).to(device)
 fed = CommunicationEfficientFedHB()
 
 # 동시성 제어를 위한 변수들
