@@ -35,7 +35,7 @@ def load_diabetes_data(csv_path, test_size=0.2, random_state=42):
 
 # EnhancerModel 정의 (서버/클라이언트 공통)
 class EnhancerModel(nn.Module):
-    def __init__(self, input_dim, num_classes=2, hidden_dims=[128, 64]):
+    def __init__(self, input_dim, num_classes=2, hidden_dims=[64, 32]):  # 더 작은 hidden_dims
         super().__init__()
         layers = []
         prev_dim = input_dim
@@ -43,7 +43,7 @@ class EnhancerModel(nn.Module):
             layers.append(nn.Linear(prev_dim, h))
             layers.append(nn.BatchNorm1d(h))
             layers.append(nn.ReLU())
-            layers.append(nn.Dropout(0.3))
+            layers.append(nn.Dropout(0.2))  # Dropout 감소
             prev_dim = h
         layers.append(nn.Linear(prev_dim, num_classes))
         self.net = nn.Sequential(*layers)
@@ -399,17 +399,17 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
     if len(data_loader.dataset) == 0:
         return client_model, float('inf'), 0, 0
     
-    # 클래스 가중치 계산 (불균형 해결)
-    num_classes = 2  # binary classification에 맞게
+    # 간소화된 클래스 가중치 계산 (속도 향상)
+    num_classes = 2
     class_counts = torch.zeros(num_classes)
     for _, y in data_loader:
         for i in range(num_classes):
             class_counts[i] += (y == i).sum()
     
-    # 클래스 가중치 계산 (적은 클래스에 더 높은 가중치)
+    # 간단한 가중치 계산
     total_samples = class_counts.sum()
-    class_weights = (total_samples / (class_counts + 1e-8)) ** 0.5  # 제곱근으로 조정
-    class_weights = class_weights / class_weights.sum() * num_classes  # 정규화
+    class_weights = total_samples / (class_counts + 1e-8)
+    class_weights = class_weights / class_weights.sum() * num_classes
     
     print(f"  클래스 분포: {class_counts}")
     print(f"  클래스 가중치: {class_weights}")
@@ -426,16 +426,16 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
                 torch.nn.init.zeros_(param)
     
     client_model.train()
-    optimizer = optim.Adam(client_model.parameters(), lr=0.001, weight_decay=1e-4)  # 학습률 더 감소
+    optimizer = optim.Adam(client_model.parameters(), lr=0.003, weight_decay=1e-4)  # 학습률 증가 (속도 향상)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.9)  # 더 자주 스케줄링
     total_loss = 0.0
     total_samples = 0
     mu = 0.01  # FedProx 파라미터 감소 (안정성 향상)
-    epochs = 5  # 에포크 수 감소 (안정성 향상)
+    epochs = 3  # 에포크 수 더 감소 (속도 향상)
     
     # Early stopping 변수
     best_loss = float('inf')
-    patience = 3
+    patience = 2  # Early stopping 조건 완화 (속도 향상)
     patience_counter = 0
     
     for epoch in range(epochs):
