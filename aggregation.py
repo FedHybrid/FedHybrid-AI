@@ -44,16 +44,12 @@ class CommunicationEfficientFedHB:
         new_state = {}
         prev_state = global_model.state_dict()
         
-        # 클라이언트 가중치 계산 (손실 기반)
+        # FedAvg 방식: 샘플 수 기반 가중치 계산
         client_weights = []
         for u in updates:
-            # 손실이 낮을수록 높은 가중치
-            weight = 1.0 / (1.0 + u.get('loss', 1.0))
+            # 각 클라이언트의 샘플 수에 비례한 가중치
+            weight = u['num_samples'] / total_samples
             client_weights.append(weight)
-        
-        # 가중치 정규화
-        total_weight = sum(client_weights)
-        client_weights = [w / total_weight for w in client_weights]
         
         for key in prev_state.keys():
             # 가중 평균 집계

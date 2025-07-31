@@ -10,6 +10,9 @@ from ckks import batch_encrypt, batch_decrypt
 from pydantic import BaseModel
 import pandas as pd
 from torch.utils.data import DataLoader
+import asyncio
+import time
+from typing import Dict, List, Optional
 
 app = FastAPI()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -26,9 +29,21 @@ num_classes = 2
 
 global_model = EnhancerModel(input_dim=input_dim, num_classes=num_classes).to(device)
 fed = CommunicationEfficientFedHB()
-updates_buffer = []
+
+# 동시성 제어를 위한 변수들
+updates_buffer: Dict[int, Dict[str, dict]] = {}  # round_id -> {client_id -> update_data}
 global_accuracies = []
-EXPECTED_CLIENTS = 1  # 예상 클라이언트 수
+current_round = 0
+round_start_time: Dict[int, float] = {}  # round_id -> start_time
+ROUND_TIMEOUT = 300  # 5분 타임아웃
+MIN_CLIENTS_PER_ROUND = 1  # 최소 클라이언트 수
+MAX_WAIT_TIME = 60  # 최대 대기 시간 (초)
+ROUND_CONFIG = {
+    "min_clients": 1,      # 최소 클라이언트 수
+    "max_clients": 50,     # 최대 클라이언트 수 (확장 가능)
+    "target_clients": 10,  # 목표 클라이언트 수
+    "adaptive_timeout": True  # 적응형 타임아웃 사용
+}
 
 # 서버 시작 시 global_model.pth가 있으면 로드, 없으면 저장
 if os.path.exists("global_model.pth"):
@@ -42,6 +57,15 @@ class UpdateRequest(BaseModel):
     original_size: int
     num_samples: int
     loss: float
+    client_id: str  # 클라이언트 식별자 추가
+    round_id: int   # 라운드 식별자 추가
+
+class RoundConfigRequest(BaseModel):
+    min_clients: Optional[int] = None
+    max_clients: Optional[int] = None
+    target_clients: Optional[int] = None
+    max_wait_time: Optional[int] = None
+    round_timeout: Optional[int] = None
 
 @app.get("/get_model")
 def get_model():
@@ -51,6 +75,62 @@ def get_model():
         # 파일이 없으면 빈 모델을 저장하고 반환
         torch.save(global_model.state_dict(), "global_model.pth")
         return FileResponse("global_model.pth", media_type="application/octet-stream", filename="global_model.pth")
+
+@app.get("/status")
+def get_status():
+    """서버 상태 및 현재 라운드 정보 반환"""
+    current_time = time.time()
+    active_rounds = {}
+    
+    for round_id, round_buffer in updates_buffer.items():
+        elapsed_time = current_time - round_start_time.get(round_id, current_time)
+        client_count = len(round_buffer)
+        
+        # 집계 조건 상태 계산
+        aggregation_status = {
+            "ready_for_aggregation": False,
+            "reason": "",
+            "conditions": {
+                "target_clients_reached": client_count >= ROUND_CONFIG["target_clients"],
+                "max_wait_time_exceeded": elapsed_time > MAX_WAIT_TIME and client_count >= ROUND_CONFIG["min_clients"],
+                "long_timeout_exceeded": elapsed_time > ROUND_TIMEOUT and client_count >= ROUND_CONFIG["min_clients"],
+                "max_clients_reached": client_count >= ROUND_CONFIG["max_clients"]
+            }
+        }
+        
+        # 집계 준비 상태 확인
+        if client_count >= ROUND_CONFIG["target_clients"]:
+            aggregation_status["ready_for_aggregation"] = True
+            aggregation_status["reason"] = f"목표 클라이언트 수 도달 ({client_count}/{ROUND_CONFIG['target_clients']})"
+        elif elapsed_time > MAX_WAIT_TIME and client_count >= ROUND_CONFIG["min_clients"]:
+            aggregation_status["ready_for_aggregation"] = True
+            aggregation_status["reason"] = f"최대 대기 시간 초과 ({elapsed_time:.1f}초)"
+        elif elapsed_time > ROUND_TIMEOUT and client_count >= ROUND_CONFIG["min_clients"]:
+            aggregation_status["ready_for_aggregation"] = True
+            aggregation_status["reason"] = f"긴 타임아웃 초과 ({elapsed_time:.1f}초)"
+        elif client_count >= ROUND_CONFIG["max_clients"]:
+            aggregation_status["ready_for_aggregation"] = True
+            aggregation_status["reason"] = f"최대 클라이언트 수 도달 ({client_count}/{ROUND_CONFIG['max_clients']})"
+        
+        active_rounds[round_id] = {
+            "clients": list(round_buffer.keys()),
+            "client_count": client_count,
+            "start_time": round_start_time.get(round_id, 0),
+            "elapsed_time": elapsed_time,
+            "aggregation_status": aggregation_status
+        }
+    
+    return {
+        "current_round": current_round,
+        "round_config": ROUND_CONFIG,
+        "timeouts": {
+            "max_wait_time": MAX_WAIT_TIME,
+            "round_timeout": ROUND_TIMEOUT
+        },
+        "active_rounds": active_rounds,
+        "total_active_rounds": len(updates_buffer),
+        "server_status": "running"
+    }
 
 @app.get("/predict_and_download")
 def predict_and_download():
@@ -143,24 +223,97 @@ def predict_and_download():
     
     # 6. 파일 다운로드 응답
     try:
+        # 파일이 존재하는지 확인
+        if not os.path.exists(output_filename):
+            print(f"파일이 존재하지 않음: {output_filename}")
+            return {"error": "파일이 생성되지 않았습니다"}
+        
+        # 파일 크기 확인
+        file_size = os.path.getsize(output_filename)
+        print(f"파일 크기: {file_size} bytes")
+        
         return FileResponse(
             output_filename, 
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=output_filename
+            filename=output_filename,
+            headers={"Content-Disposition": f"attachment; filename={output_filename}"}
         )
     except Exception as e:
         print(f"파일 다운로드 응답 실패: {e}")
-        return {"error": "파일 다운로드 실패"}
+        return {"error": f"파일 다운로드 실패: {str(e)}"}
+
+@app.post("/config")
+def update_round_config(request: RoundConfigRequest):
+    """라운드 설정 동적 변경"""
+    global ROUND_CONFIG, MAX_WAIT_TIME, ROUND_TIMEOUT
+    
+    changes = {}
+    
+    if request.min_clients is not None:
+        if request.min_clients > 0 and request.min_clients <= ROUND_CONFIG["max_clients"]:
+            ROUND_CONFIG["min_clients"] = request.min_clients
+            changes["min_clients"] = request.min_clients
+        else:
+            return {"error": f"min_clients는 1 이상 {ROUND_CONFIG['max_clients']} 이하여야 합니다"}
+    
+    if request.max_clients is not None:
+        if request.max_clients >= ROUND_CONFIG["min_clients"] and request.max_clients <= 100:
+            ROUND_CONFIG["max_clients"] = request.max_clients
+            changes["max_clients"] = request.max_clients
+        else:
+            return {"error": f"max_clients는 {ROUND_CONFIG['min_clients']} 이상 100 이하여야 합니다"}
+    
+    if request.target_clients is not None:
+        if ROUND_CONFIG["min_clients"] <= request.target_clients <= ROUND_CONFIG["max_clients"]:
+            ROUND_CONFIG["target_clients"] = request.target_clients
+            changes["target_clients"] = request.target_clients
+        else:
+            return {"error": f"target_clients는 {ROUND_CONFIG['min_clients']} 이상 {ROUND_CONFIG['max_clients']} 이하여야 합니다"}
+    
+    if request.max_wait_time is not None:
+        if 10 <= request.max_wait_time <= 600:
+            MAX_WAIT_TIME = request.max_wait_time
+            changes["max_wait_time"] = request.max_wait_time
+        else:
+            return {"error": "max_wait_time는 10초 이상 600초 이하여야 합니다"}
+    
+    if request.round_timeout is not None:
+        if 60 <= request.round_timeout <= 1800:
+            ROUND_TIMEOUT = request.round_timeout
+            changes["round_timeout"] = request.round_timeout
+        else:
+            return {"error": "round_timeout는 60초 이상 1800초 이하여야 합니다"}
+    
+    return {
+        "message": "설정이 성공적으로 업데이트되었습니다",
+        "changes": changes,
+        "current_config": {
+            "round_config": ROUND_CONFIG,
+            "max_wait_time": MAX_WAIT_TIME,
+            "round_timeout": ROUND_TIMEOUT
+        }
+    }
 
 @app.post("/aggregate")
 async def aggregate(request: UpdateRequest):
-    global global_model, updates_buffer, global_accuracies
+    global global_model, updates_buffer, global_accuracies, current_round, round_start_time
     
-    print(f"\n=== 서버: 클라이언트 암호화된 데이터 수신 ===")
+    print(f"\n=== 서버: 클라이언트 {request.client_id} 암호화된 데이터 수신 (라운드 {request.round_id}) ===")
     print(f"받은 c0_list 길이: {len(request.c0_list)}")
     print(f"받은 c1_list 길이: {len(request.c1_list)}")
     print(f"원본 크기: {request.original_size}")
     print(f"샘플 수: {request.num_samples}")
+    
+    # 라운드별 버퍼 초기화
+    if request.round_id not in updates_buffer:
+        updates_buffer[request.round_id] = {}
+        round_start_time[request.round_id] = time.time()
+        print(f"새 라운드 {request.round_id} 버퍼 생성")
+    
+    # 현재 라운드 업데이트
+    current_round = max(updates_buffer.keys())
+    print(f"현재 진행 중인 라운드: {current_round}")
+    print(f"활성 라운드들: {list(updates_buffer.keys())}")
     
     # 1) JSON → numpy array (암호화된 상태)
     c0_list = [np.array([complex(c[0], c[1]) for c in c0], dtype=np.complex128) for c0 in request.c0_list]
@@ -170,62 +323,85 @@ async def aggregate(request: UpdateRequest):
     print(f"첫 번째 배치 c0 범위: {c0_list[0].min()} ~ {c0_list[0].max()}")
     print(f"첫 번째 배치 c1 범위: {c1_list[0].min()} ~ {c1_list[0].max()}")
     
-    # 2) CKKS 배치 복호화 (필요시에만)
-    # m_vals = batch_decrypt(c0_list, c1_list, request.original_size, batch_size=4)
-    # print(f"복호화 완료: {len(m_vals)}개 값")
-    # print(f"복호화된 값 범위: {m_vals.real.min():.4f} ~ {m_vals.real.max():.4f}")
-    # print(f"복호화된 값 평균: {m_vals.real.mean():.4f}")
-    
-    # 3) 복호화된 벡터 → torch tensor + 원래 모델 shape 복원 (필요시에만)
-    # ptr = 0
-    # unflat_state = {}
-    # for k, v in global_model.state_dict().items():
-    #     numel = v.numel()
-    #     arr = torch.from_numpy(
-    #         m_vals[ptr:ptr+numel].astype(np.float32)
-    #     ).view(v.size())
-    #     unflat_state[k] = arr.to(device)
-    #     ptr += numel
-    #     print(f"파라미터 {k}: shape={v.size()}, 값 범위={arr.min().item():.4f}~{arr.max().item():.4f}")
-    # 
-    # print(f"모델 파라미터 복원 완료: {len(unflat_state)}개 레이어")
-    
-    # 4) 암호화된 데이터 저장 (기존 버퍼 초기화 후 새로 추가)
-    updates_buffer = [{
+    # 2) 클라이언트 업데이트 저장 (라운드별)
+    updates_buffer[request.round_id][request.client_id] = {
         'c0_list': c0_list,
         'c1_list': c1_list,
         'num_samples': request.num_samples,
-        'loss': request.loss
-    }]
-    print(f"업데이트 버퍼 초기화 및 새 업데이트 추가: {len(updates_buffer)}/{EXPECTED_CLIENTS}")
+        'loss': request.loss,
+        'timestamp': time.time()
+    }
     
-    if len(updates_buffer) >= EXPECTED_CLIENTS:
-        print(f"\n=== 서버: 암호화된 상태에서 평균 계산 시작 ===")
-        print(f"현재 버퍼에 {len(updates_buffer)}개 업데이트 있음")
+    print(f"클라이언트 {request.client_id} 업데이트 저장 완료 (라운드 {request.round_id})")
+    print(f"라운드 {request.round_id} 버퍼 상태: {len(updates_buffer[request.round_id])}/{ROUND_CONFIG['target_clients']} 클라이언트 (목표)")
+    print(f"라운드 {request.round_id} 대기 중인 클라이언트: {list(updates_buffer[request.round_id].keys())}")
+    
+    # 3) 타임아웃 체크
+    current_time = time.time()
+    if current_time - round_start_time[request.round_id] > ROUND_TIMEOUT:
+        print(f"라운드 {request.round_id} 타임아웃 발생 ({ROUND_TIMEOUT}초)")
+        # 타임아웃 시 현재까지 받은 업데이트로 집계 진행
+    
+    # 4) 적응형 라운드별 집계 조건 확인
+    round_buffer = updates_buffer[request.round_id]
+    elapsed_time = current_time - round_start_time[request.round_id]
+    client_count = len(round_buffer)
+    
+    # 적응형 집계 조건 계산
+    should_aggregate = False
+    aggregation_reason = ""
+    
+    # 조건 1: 목표 클라이언트 수 도달
+    if client_count >= ROUND_CONFIG["target_clients"]:
+        should_aggregate = True
+        aggregation_reason = f"목표 클라이언트 수 도달 ({client_count}/{ROUND_CONFIG['target_clients']})"
+    
+    # 조건 2: 최대 대기 시간 초과 (적응형)
+    elif elapsed_time > MAX_WAIT_TIME and client_count >= ROUND_CONFIG["min_clients"]:
+        should_aggregate = True
+        aggregation_reason = f"최대 대기 시간 초과 ({elapsed_time:.1f}초 > {MAX_WAIT_TIME}초)"
+    
+    # 조건 3: 긴 타임아웃 (네트워크 문제 등)
+    elif elapsed_time > ROUND_TIMEOUT and client_count >= ROUND_CONFIG["min_clients"]:
+        should_aggregate = True
+        aggregation_reason = f"긴 타임아웃 초과 ({elapsed_time:.1f}초 > {ROUND_TIMEOUT}초)"
+    
+    # 조건 4: 최대 클라이언트 수 도달
+    elif client_count >= ROUND_CONFIG["max_clients"]:
+        should_aggregate = True
+        aggregation_reason = f"최대 클라이언트 수 도달 ({client_count}/{ROUND_CONFIG['max_clients']})"
+    
+    print(f"집계 조건 확인: {client_count}개 클라이언트, {elapsed_time:.1f}초 경과")
+    print(f"집계 여부: {should_aggregate} ({aggregation_reason})")
+    
+    if should_aggregate:
+        print(f"\n=== 서버: 라운드 {request.round_id} 암호화된 상태에서 평균 계산 시작 ===")
+        print(f"집계 사유: {aggregation_reason}")
+        print(f"라운드 {request.round_id}에 {len(round_buffer)}개 업데이트 있음")
+        print(f"참여 클라이언트: {list(round_buffer.keys())}")
         
-        # 손실 기반 가중치 계산
-        client_weights = []
-        for update in updates_buffer:
-            # 손실이 낮을수록 높은 가중치
-            weight = 1.0 / (1.0 + update['loss'])
-            client_weights.append(weight)
+        # FedAvg 방식: 샘플 수 기반 가중치 계산
+        client_weights = {}
+        total_samples = sum(update['num_samples'] for update in round_buffer.values())
         
-        # 가중치 정규화
-        total_weight = sum(client_weights)
-        client_weights = [w / total_weight for w in client_weights]
+        for client_id, update in round_buffer.items():
+            # 각 클라이언트의 샘플 수에 비례한 가중치
+            weight = update['num_samples'] / total_samples
+            client_weights[client_id] = weight
         
-        print(f"클라이언트 가중치: {[f'{w:.3f}' for w in client_weights]}")
+        print(f"클라이언트 가중치: {[(cid, f'{w:.3f}') for cid, w in client_weights.items()]}")
         
         # 암호화된 상태에서 가중 평균 계산 (복호화 없이)
         from ckks import ckks_add, ckks_scale
         
         # 첫 번째 클라이언트의 암호문을 가중치로 스케일링
-        first_update = updates_buffer[0]
-        weight = client_weights[0]
+        first_client_id = list(round_buffer.keys())[0]
+        first_update = round_buffer[first_client_id]
+        weight = client_weights[first_client_id]
         c0_list_agg = []
         c1_list_agg = []
         
-        print(f"클라이언트 손실: {first_update['loss']:.4f}")
+        print(f"클라이언트 {first_client_id} 샘플 수: {first_update['num_samples']}")
         print(f"적용할 가중치: {weight:.4f}")
         
         for c0, c1 in zip(first_update['c0_list'], first_update['c1_list']):
@@ -233,16 +409,16 @@ async def aggregate(request: UpdateRequest):
             c0_list_agg.append(c0_scaled)
             c1_list_agg.append(c1_scaled)
         
-        print(f"첫 번째 클라이언트 (가중치: {weight:.3f})로 시작")
+        print(f"첫 번째 클라이언트 {first_client_id} (가중치: {weight:.3f})로 시작")
         
         # 단일 클라이언트인 경우 가중치만 적용
-        if len(updates_buffer) == 1:
+        if len(round_buffer) == 1:
             print(f"단일 클라이언트: 가중치 {weight:.3f} 적용 완료")
         else:
             # 나머지 클라이언트들과 암호화된 상태에서 가중 평균 계산
-            for i, update in enumerate(updates_buffer[1:], 1):
-                weight = client_weights[i]
-                print(f"클라이언트 {i+1} (가중치: {weight:.3f})와 가중 평균 계산")
+            for client_id, update in list(round_buffer.items())[1:]:
+                weight = client_weights[client_id]
+                print(f"클라이언트 {client_id} (가중치: {weight:.3f})와 가중 평균 계산")
                 
                 # 각 배치별로 가중치 적용 후 덧셈 수행
                 for j in range(len(c0_list_agg)):
@@ -266,7 +442,16 @@ async def aggregate(request: UpdateRequest):
             print(f"평균 계산된 첫 번째 배치 c0 범위: {first_c0.min()} ~ {first_c0.max()}")
             print(f"평균 계산된 첫 번째 배치 c1 범위: {first_c1.min()} ~ {first_c1.max()}")
         
-        updates_buffer.clear()
+        # 라운드 완료 처리
+        print(f"라운드 {request.round_id} 완료")
+        
+        # 완료된 라운드 정리
+        del updates_buffer[request.round_id]
+        if request.round_id in round_start_time:
+            del round_start_time[request.round_id]
+        
+        print(f"라운드 {request.round_id} 정리 완료")
+        print(f"남은 활성 라운드: {list(updates_buffer.keys())}")
         
         # 5단계: 클라이언트로 암호화된 평균 결과 전송
         response = {

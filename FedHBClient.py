@@ -74,20 +74,12 @@ for r in range(NUM_ROUNDS):
     )
     acc_after = evaluate_local_accuracy(updated_model, train_loader, device)
     
-    # FedAvg 방식: 글로벌 모델과 로컬 모델의 가중 평균 (로컬 빠른 업데이트)
-    print(f"=== FedAvg 집계 시작 ===")
-    alpha = 0.1  # 글로벌 모델 업데이트 비율
+    # 로컬 학습 완료된 모델을 그대로 사용 (FedAvg 원칙)
+    print(f"=== 로컬 학습 완료 ===")
+    print(f"로컬 학습된 모델 파라미터를 서버로 전송할 준비 완료")
     
-    for name, param in client_model.named_parameters():
-        if name in global_model.state_dict():
-            # 글로벌 모델 = (1-α) * 글로벌 모델 + α * 로컬 모델
-            global_param = global_model.state_dict()[name]
-            local_param = updated_model.state_dict()[name]
-            new_param = (1 - alpha) * global_param + alpha * local_param
-            global_model.state_dict()[name].copy_(new_param)
-            client_model.state_dict()[name].copy_(new_param)
-    
-    print(f"FedAvg 집계 완료 (α={alpha})")
+    # 학습된 모델을 클라이언트 모델에 복사
+    client_model.load_state_dict(updated_model.state_dict())
     
     # === 1단계: 클라이언트 데이터를 CKKS로 암호화 ===
     print(f"\n=== 1단계: 클라이언트 데이터 CKKS 암호화 ===")
@@ -114,7 +106,9 @@ for r in range(NUM_ROUNDS):
         "c1_list": [[[float(c.real), float(c.imag)] for c in c1] for c1 in c1_list],
         "original_size": len(m_coeffs),
         "num_samples": num_samples,
-        "loss": avg_loss
+        "loss": avg_loss,
+        "client_id": f"client_{r+1}",  # 클라이언트 식별자
+        "round_id": r+1  # 라운드 식별자
     }
     print(f"전송할 페이로드 크기: {len(payload['c0_list'])}개 배치")
     
