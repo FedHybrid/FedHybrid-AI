@@ -23,8 +23,8 @@ rescale_q = z_q  # 리스케일링용 스케일
 N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
-# input_dim을 클라이언트와 반드시 동일하게 명시 (개선된 모델은 8개 특성 사용)
-input_dim = 8
+# input_dim을 클라이언트와 반드시 동일하게 명시 (클라이언트는 11개 특성 사용)
+input_dim = 11
 num_classes = 2
 
 global_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=num_classes).to(device)
@@ -142,25 +142,28 @@ def predict_and_download():
     
     # 1. 원본 데이터 로드
     try:
-        df = pd.read_csv('diabetic_data.csv')
-        print(f"원본 데이터 로드 완료: {len(df)}행, {len(df.columns)}열")
+        original_df = pd.read_csv('diabetic_data.csv')
+        print(f"원본 데이터 로드 완료: {len(original_df)}행, {len(original_df.columns)}열")
     except Exception as e:
         print(f"데이터 로드 실패: {e}")
         return {"error": "데이터 로드 실패"}
     
-    # 2. 데이터 전처리 (클라이언트와 동일한 방식)
+    # 2. 예측용 데이터 전처리 (별도로 처리)
     try:
+        df_for_prediction = original_df.copy()
         # 클라이언트와 동일한 전처리 적용
         drop_cols = ['encounter_id', 'patient_nbr']
-        df_processed = df.drop(columns=drop_cols)
-        df_processed['readmitted'] = df_processed['readmitted'].map(lambda x: 0 if x == 'NO' else 1)
+        if all(col in df_for_prediction.columns for col in drop_cols):
+            df_for_prediction = df_for_prediction.drop(columns=drop_cols)
+        if 'readmitted' in df_for_prediction.columns:
+            df_for_prediction['readmitted'] = df_for_prediction['readmitted'].map(lambda x: 0 if x == 'NO' else 1)
         
         # 숫자형 컬럼만 feature로 사용
-        numeric_cols = df_processed.select_dtypes(include=['int64', 'float64']).columns.tolist()
+        numeric_cols = df_for_prediction.select_dtypes(include=['int64', 'float64']).columns.tolist()
         numeric_cols = [col for col in numeric_cols if col != 'readmitted']
         
-        X = df_processed[numeric_cols].values.astype('float32')
-        print(f"전처리 완료: {X.shape}")
+        X = df_for_prediction[numeric_cols].values.astype('float32')
+        print(f"예측용 데이터 준비: {X.shape}")
     except Exception as e:
         print(f"전처리 실패: {e}")
         return {"error": "데이터 전처리 실패"}
@@ -183,29 +186,27 @@ def predict_and_download():
                 preds = torch.argmax(outputs, dim=1)
                 
                 predictions.extend(preds.cpu().numpy())
-                probabilities.extend(probs.cpu().numpy())
+                probabilities.extend(probs[:, 1].cpu().numpy())  # 당뇨병 확률 (클래스 1)
         
         predictions = np.array(predictions)
         probabilities = np.array(probabilities)
         
         print(f"예측 완료: {len(predictions)}개 샘플")
         print(f"예측 결과 분포: {np.bincount(predictions)}")
+        print(f"평균 당뇨병 확률: {np.mean(probabilities):.4f}")
     except Exception as e:
         print(f"예측 실패: {e}")
         return {"error": "모델 예측 실패"}
     
-    # 4. 원본 데이터에 예측 결과 추가
+    # 4. 원본 데이터에 예측 결과 추가 (원본 형식 유지)
     try:
-        df_result = df.copy()
-        df_result['predicted_readmission'] = predictions
-        df_result['readmission_probability'] = probabilities[:, 1]  # 재입원 확률
-        df_result['prediction_confidence'] = np.max(probabilities, axis=1)
+        df_result = original_df.copy()
+        df_result['당뇨병_확률'] = probabilities
+        df_result['예측_결과'] = predictions
+        df_result['예측_라벨'] = ['당뇨병' if p == 1 else '정상' for p in predictions]
         
-        # 예측 결과 해석 추가
-        df_result['prediction_interpretation'] = df_result['predicted_readmission'].map({
-            0: '재입원 위험 낮음',
-            1: '재입원 위험 높음'
-        })
+        # 확률별로 정렬
+        df_result = df_result.sort_values('당뇨병_확률', ascending=False)
         
         print(f"결과 데이터 생성 완료: {len(df_result)}행, {len(df_result.columns)}열")
     except Exception as e:
@@ -215,10 +216,52 @@ def predict_and_download():
     # 5. 엑셀 파일 저장
     try:
         output_filename = "diabetic_predictions.xlsx"
-        df_result.to_excel(output_filename, index=False, engine='openpyxl')
+        
+        # openpyxl 엔진을 사용하여 엑셀 파일 생성
+        with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+            # 메인 결과 시트 (원본 데이터 + 예측 결과)
+            df_result.to_excel(writer, sheet_name='예측결과', index=False)
+            
+            # 요약 통계 시트 추가
+            summary_data = {
+                '항목': ['총 데이터 수', '당뇨병 예측 수', '정상 예측 수', '평균 당뇨병 확률'],
+                '값': [
+                    len(df_result),
+                    sum(predictions),
+                    len(predictions) - sum(predictions),
+                    f"{np.mean(probabilities):.4f}"
+                ]
+            }
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, sheet_name='요약통계', index=False)
+            
+            # 확률 구간별 분포
+            prob_ranges = [
+                (0.0, 0.2, '매우 낮음'),
+                (0.2, 0.4, '낮음'),
+                (0.4, 0.6, '보통'),
+                (0.6, 0.8, '높음'),
+                (0.8, 1.0, '매우 높음')
+            ]
+            
+            range_data = []
+            for low, high, label in prob_ranges:
+                count = sum((probabilities >= low) & (probabilities < high))
+                range_data.append({
+                    '확률_구간': f"{low:.1f}-{high:.1f}",
+                    '라벨': label,
+                    '데이터_수': count,
+                    '비율': f"{count/len(probabilities)*100:.1f}%"
+                })
+            
+            range_df = pd.DataFrame(range_data)
+            range_df.to_excel(writer, sheet_name='확률구간별분포', index=False)
+        
         print(f"엑셀 파일 저장 완료: {output_filename}")
     except Exception as e:
         print(f"엑셀 파일 저장 실패: {e}")
+        import traceback
+        traceback.print_exc()
         return {"error": "엑셀 파일 저장 실패"}
     
     # 6. 파일 다운로드 응답

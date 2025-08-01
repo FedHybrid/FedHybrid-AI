@@ -446,15 +446,15 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
             output = client_model(x)
             loss = weighted_criterion(output, y)  # 가중 손실 사용
             
-            # FedProx (일시적 비활성화 - 안정성 향상)
-            if use_fedprox and False:  # 일시적 비활성화
+            # FedProx (활성화)
+            if use_fedprox and round_idx > 0:
                 prox_loss = 0.0
                 for w, w_t in zip(client_model.parameters(), global_model.parameters()):
                     prox_loss += ((w - w_t.detach()) ** 2).sum()
                 loss += mu * prox_loss
             
-            # Knowledge Distillation (일시적 비활성화 - 안정성 향상)
-            if use_kd and round_idx > 0 and False:  # 일시적 비활성화
+            # Knowledge Distillation (활성화)
+            if use_kd and round_idx > 0:
                 with torch.no_grad():
                     global_model.eval()
                     temperature = 3.0 * np.exp(-0.1 * round_idx)
