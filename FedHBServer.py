@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 import torch
 from improved_model import ImprovedEnhancerModel, load_improved_diabetes_data
 from aggregation import CommunicationEfficientFedHB
@@ -13,9 +14,54 @@ from torch.utils.data import DataLoader
 import asyncio
 import time
 from typing import Dict, List, Optional
+import sys
+from datetime import datetime
+
+# 로그 출력 개선을 위한 설정
+def log_message(level: str, message: str):
+    """타임스탬프와 로그 레벨을 포함한 로그 메시지 출력"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    level_colors = {
+        "INFO": "\033[94m",    # 파란색
+        "WARNING": "\033[93m", # 노란색
+        "ERROR": "\033[91m",   # 빨간색
+        "SUCCESS": "\033[92m", # 초록색
+        "DEBUG": "\033[90m"    # 회색
+    }
+    color = level_colors.get(level, "")
+    reset = "\033[0m"
+    
+    log_line = f"[{timestamp}] {color}{level}{reset}: {message}"
+    print(log_line, flush=True)  # 실시간 플러싱
+
+def log_info(message: str):
+    log_message("INFO", message)
+
+def log_warning(message: str):
+    log_message("WARNING", message)
+
+def log_error(message: str):
+    log_message("ERROR", message)
+
+def log_success(message: str):
+    log_message("SUCCESS", message)
+
+def log_debug(message: str):
+    log_message("DEBUG", message)
 
 app = FastAPI()
+
+# CORS 설정 추가
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Next.js 클라이언트 주소
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+log_info(f"디바이스 설정: {device}")
 
 # CKKS 파라미터 설정 (클라이언트와 동일)
 z_q = 1 << 10   # 2^10 = 1,024 (평문 인코딩용 스케일)
@@ -23,8 +69,8 @@ rescale_q = z_q  # 리스케일링용 스케일
 N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
-# input_dim을 클라이언트와 반드시 동일하게 명시 (클라이언트는 11개 특성 사용)
-input_dim = 11
+# input_dim을 클라이언트와 반드시 동일하게 명시 (클라이언트는 13개 특성 사용)
+input_dim = 13
 num_classes = 2
 
 global_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=num_classes).to(device)
@@ -48,8 +94,10 @@ ROUND_CONFIG = {
 # 서버 시작 시 global_model.pth가 있으면 로드, 없으면 저장
 if os.path.exists("global_model.pth"):
     global_model.load_state_dict(torch.load("global_model.pth", map_location=device, weights_only=False))
+    log_success("기존 글로벌 모델 로드 완료")
 else:
     torch.save(global_model.state_dict(), "global_model.pth")
+    log_info("새 글로벌 모델 생성 및 저장 완료")
 
 class UpdateRequest(BaseModel):
     c0_list: list
@@ -70,9 +118,11 @@ class RoundConfigRequest(BaseModel):
 @app.get("/get_model")
 def get_model():
     if os.path.exists("global_model.pth"):
+        log_debug("글로벌 모델 파일 요청 - 기존 파일 반환")
         return FileResponse("global_model.pth", media_type="application/octet-stream", filename="global_model.pth")
     else:
         # 파일이 없으면 빈 모델을 저장하고 반환
+        log_warning("글로벌 모델 파일이 없어 새로 생성")
         torch.save(global_model.state_dict(), "global_model.pth")
         return FileResponse("global_model.pth", media_type="application/octet-stream", filename="global_model.pth")
 
@@ -161,6 +211,7 @@ def predict_and_download():
         # 숫자형 컬럼만 feature로 사용
         numeric_cols = df_for_prediction.select_dtypes(include=['int64', 'float64']).columns.tolist()
         numeric_cols = [col for col in numeric_cols if col != 'readmitted']
+        numeric_cols = [col for col in numeric_cols if col != 'max_glu_serum']
         
         X = df_for_prediction[numeric_cols].values.astype('float32')
         print(f"예측용 데이터 준비: {X.shape}")
@@ -337,34 +388,80 @@ def update_round_config(request: RoundConfigRequest):
         }
     }
 
+@app.post("/upload_data")
+async def upload_data(file: UploadFile = File(...)):
+    """데이터 파일 업로드 및 학습 시작"""
+    try:
+        print(f"\n=== 서버: 데이터 파일 업로드 시작 ===")
+        print(f"업로드된 파일: {file.filename}")
+        
+        # 파일 확장자 확인
+        if not file.filename.lower().endswith(('.csv', '.xlsx', '.xls')):
+            return {"error": "CSV 또는 Excel 파일만 업로드 가능합니다."}
+        
+        # 파일 저장
+        file_path = f"uploaded_{file.filename}"
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        print(f"파일 저장 완료: {file_path}")
+        
+        # 기존 데이터 파일 백업 (있는 경우)
+        if os.path.exists("diabetic_data.csv"):
+            backup_path = f"diabetic_data_backup_{int(time.time())}.csv"
+            os.rename("diabetic_data.csv", backup_path)
+            print(f"기존 데이터 백업: {backup_path}")
+        
+        # 업로드된 파일을 diabetic_data.csv로 복사
+        import shutil
+        shutil.copy2(file_path, "diabetic_data.csv")
+        print(f"데이터 파일 업데이트 완료: diabetic_data.csv")
+        
+        # 전역 모델 초기화 (새 데이터로 학습 시작)
+        global global_model
+        global_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=num_classes).to(device)
+        torch.save(global_model.state_dict(), "global_model.pth")
+        print("전역 모델 초기화 완료")
+        
+        return {
+            "message": "데이터 업로드 및 모델 초기화가 완료되었습니다.",
+            "filename": file.filename,
+            "file_path": file_path
+        }
+        
+    except Exception as e:
+        print(f"데이터 업로드 실패: {e}")
+        return {"error": f"데이터 업로드 실패: {str(e)}"}
+
 @app.post("/aggregate")
 async def aggregate(request: UpdateRequest):
     global global_model, updates_buffer, global_accuracies, current_round, round_start_time
     
-    print(f"\n=== 서버: 클라이언트 {request.client_id} 암호화된 데이터 수신 (라운드 {request.round_id}) ===")
-    print(f"받은 c0_list 길이: {len(request.c0_list)}")
-    print(f"받은 c1_list 길이: {len(request.c1_list)}")
-    print(f"원본 크기: {request.original_size}")
-    print(f"샘플 수: {request.num_samples}")
+    log_info(f"=== 클라이언트 {request.client_id} 암호화된 데이터 수신 (라운드 {request.round_id}) ===")
+    log_debug(f"받은 c0_list 길이: {len(request.c0_list)}")
+    log_debug(f"받은 c1_list 길이: {len(request.c1_list)}")
+    log_debug(f"원본 크기: {request.original_size}")
+    log_debug(f"샘플 수: {request.num_samples}")
     
     # 라운드별 버퍼 초기화
     if request.round_id not in updates_buffer:
         updates_buffer[request.round_id] = {}
         round_start_time[request.round_id] = time.time()
-        print(f"새 라운드 {request.round_id} 버퍼 생성")
+        log_info(f"새 라운드 {request.round_id} 버퍼 생성")
     
     # 현재 라운드 업데이트
     current_round = max(updates_buffer.keys())
-    print(f"현재 진행 중인 라운드: {current_round}")
-    print(f"활성 라운드들: {list(updates_buffer.keys())}")
+    log_debug(f"현재 진행 중인 라운드: {current_round}")
+    log_debug(f"활성 라운드들: {list(updates_buffer.keys())}")
     
     # 1) JSON → numpy array (암호화된 상태)
     c0_list = [np.array([complex(c[0], c[1]) for c in c0], dtype=np.complex128) for c0 in request.c0_list]
     c1_list = [np.array([complex(c[0], c[1]) for c in c1], dtype=np.complex128) for c1 in request.c1_list]
     
-    print(f"암호화된 데이터 변환 완료: {len(c0_list)}개 배치")
-    print(f"첫 번째 배치 c0 범위: {c0_list[0].min()} ~ {c0_list[0].max()}")
-    print(f"첫 번째 배치 c1 범위: {c1_list[0].min()} ~ {c1_list[0].max()}")
+    log_debug(f"암호화된 데이터 변환 완료: {len(c0_list)}개 배치")
+    log_debug(f"첫 번째 배치 c0 범위: {c0_list[0].min()} ~ {c0_list[0].max()}")
+    log_debug(f"첫 번째 배치 c1 범위: {c1_list[0].min()} ~ {c1_list[0].max()}")
     
     # 2) 클라이언트 업데이트 저장 (라운드별)
     updates_buffer[request.round_id][request.client_id] = {
@@ -375,14 +472,14 @@ async def aggregate(request: UpdateRequest):
         'timestamp': time.time()
     }
     
-    print(f"클라이언트 {request.client_id} 업데이트 저장 완료 (라운드 {request.round_id})")
-    print(f"라운드 {request.round_id} 버퍼 상태: {len(updates_buffer[request.round_id])}/{ROUND_CONFIG['target_clients']} 클라이언트 (목표)")
-    print(f"라운드 {request.round_id} 대기 중인 클라이언트: {list(updates_buffer[request.round_id].keys())}")
+    log_success(f"클라이언트 {request.client_id} 업데이트 저장 완료 (라운드 {request.round_id})")
+    log_info(f"라운드 {request.round_id} 버퍼 상태: {len(updates_buffer[request.round_id])}/{ROUND_CONFIG['target_clients']} 클라이언트 (목표)")
+    log_debug(f"라운드 {request.round_id} 대기 중인 클라이언트: {list(updates_buffer[request.round_id].keys())}")
     
     # 3) 타임아웃 체크
     current_time = time.time()
     if current_time - round_start_time[request.round_id] > ROUND_TIMEOUT:
-        print(f"라운드 {request.round_id} 타임아웃 발생 ({ROUND_TIMEOUT}초)")
+        log_warning(f"라운드 {request.round_id} 타임아웃 발생 ({ROUND_TIMEOUT}초)")
         # 타임아웃 시 현재까지 받은 업데이트로 집계 진행
     
     # 4) 적응형 라운드별 집계 조건 확인
@@ -414,14 +511,14 @@ async def aggregate(request: UpdateRequest):
         should_aggregate = True
         aggregation_reason = f"최대 클라이언트 수 도달 ({client_count}/{ROUND_CONFIG['max_clients']})"
     
-    print(f"집계 조건 확인: {client_count}개 클라이언트, {elapsed_time:.1f}초 경과")
-    print(f"집계 여부: {should_aggregate} ({aggregation_reason})")
+    log_info(f"집계 조건 확인: {client_count}개 클라이언트, {elapsed_time:.1f}초 경과")
+    log_info(f"집계 여부: {should_aggregate} ({aggregation_reason})")
     
     if should_aggregate:
-        print(f"\n=== 서버: 라운드 {request.round_id} 암호화된 상태에서 평균 계산 시작 ===")
-        print(f"집계 사유: {aggregation_reason}")
-        print(f"라운드 {request.round_id}에 {len(round_buffer)}개 업데이트 있음")
-        print(f"참여 클라이언트: {list(round_buffer.keys())}")
+        log_success(f"=== 라운드 {request.round_id} 암호화된 상태에서 평균 계산 시작 ===")
+        log_info(f"집계 사유: {aggregation_reason}")
+        log_info(f"라운드 {request.round_id}에 {len(round_buffer)}개 업데이트 있음")
+        log_debug(f"참여 클라이언트: {list(round_buffer.keys())}")
         
         # FedAvg 방식: 샘플 수 기반 가중치 계산
         client_weights = {}
@@ -432,7 +529,7 @@ async def aggregate(request: UpdateRequest):
             weight = update['num_samples'] / total_samples
             client_weights[client_id] = weight
         
-        print(f"클라이언트 가중치: {[(cid, f'{w:.3f}') for cid, w in client_weights.items()]}")
+        log_info(f"클라이언트 가중치: {[(cid, f'{w:.3f}') for cid, w in client_weights.items()]}")
         
         # 암호화된 상태에서 가중 평균 계산 (복호화 없이)
         from ckks import ckks_add, ckks_scale
@@ -444,24 +541,24 @@ async def aggregate(request: UpdateRequest):
         c0_list_agg = []
         c1_list_agg = []
         
-        print(f"클라이언트 {first_client_id} 샘플 수: {first_update['num_samples']}")
-        print(f"적용할 가중치: {weight:.4f}")
+        log_debug(f"클라이언트 {first_client_id} 샘플 수: {first_update['num_samples']}")
+        log_debug(f"적용할 가중치: {weight:.4f}")
         
         for c0, c1 in zip(first_update['c0_list'], first_update['c1_list']):
             c0_scaled, c1_scaled = ckks_scale((c0, c1), weight)
             c0_list_agg.append(c0_scaled)
             c1_list_agg.append(c1_scaled)
         
-        print(f"첫 번째 클라이언트 {first_client_id} (가중치: {weight:.3f})로 시작")
+        log_info(f"첫 번째 클라이언트 {first_client_id} (가중치: {weight:.3f})로 시작")
         
         # 단일 클라이언트인 경우 가중치만 적용
         if len(round_buffer) == 1:
-            print(f"단일 클라이언트: 가중치 {weight:.3f} 적용 완료")
+            log_success(f"단일 클라이언트: 가중치 {weight:.3f} 적용 완료")
         else:
             # 나머지 클라이언트들과 암호화된 상태에서 가중 평균 계산
             for client_id, update in list(round_buffer.items())[1:]:
                 weight = client_weights[client_id]
-                print(f"클라이언트 {client_id} (가중치: {weight:.3f})와 가중 평균 계산")
+                log_info(f"클라이언트 {client_id} (가중치: {weight:.3f})와 가중 평균 계산")
                 
                 # 각 배치별로 가중치 적용 후 덧셈 수행
                 for j in range(len(c0_list_agg)):
@@ -476,25 +573,25 @@ async def aggregate(request: UpdateRequest):
                     c0_list_agg[j] = c0_sum
                     c1_list_agg[j] = c1_sum
         
-        print(f"암호화된 상태에서 평균 계산 완료")
+        log_success(f"암호화된 상태에서 평균 계산 완료")
         
         # 디버깅: 첫 번째 배치의 값 확인
         if len(c0_list_agg) > 0:
             first_c0 = c0_list_agg[0]
             first_c1 = c1_list_agg[0]
-            print(f"평균 계산된 첫 번째 배치 c0 범위: {first_c0.min()} ~ {first_c0.max()}")
-            print(f"평균 계산된 첫 번째 배치 c1 범위: {first_c1.min()} ~ {first_c1.max()}")
+            log_debug(f"평균 계산된 첫 번째 배치 c0 범위: {first_c0.min()} ~ {first_c0.max()}")
+            log_debug(f"평균 계산된 첫 번째 배치 c1 범위: {first_c1.min()} ~ {first_c1.max()}")
         
         # 라운드 완료 처리
-        print(f"라운드 {request.round_id} 완료")
+        log_success(f"라운드 {request.round_id} 완료")
         
         # 완료된 라운드 정리
         del updates_buffer[request.round_id]
         if request.round_id in round_start_time:
             del round_start_time[request.round_id]
         
-        print(f"라운드 {request.round_id} 정리 완료")
-        print(f"남은 활성 라운드: {list(updates_buffer.keys())}")
+        log_info(f"라운드 {request.round_id} 정리 완료")
+        log_debug(f"남은 활성 라운드: {list(updates_buffer.keys())}")
         
         # 5단계: 클라이언트로 암호화된 평균 결과 전송
         response = {
@@ -502,7 +599,7 @@ async def aggregate(request: UpdateRequest):
             "c1_list": [[[float(c.real), float(c.imag)] for c in c1] for c1 in c1_list_agg],
             "original_size": request.original_size
         }
-        print(f"클라이언트로 암호화된 평균 결과 전송 완료")
+        log_success(f"클라이언트로 암호화된 평균 결과 전송 완료")
         return response
     
     return {"status": "waiting"}
@@ -513,4 +610,9 @@ def save_global_model_atomic(model, path="global_model.pth"):
     os.replace(tmp_path, path)
 
 if __name__ == "__main__":
+    log_success("=== FedHybrid 서버 시작 ===")
+    log_info(f"서버 주소: http://0.0.0.0:8000")
+    log_info(f"CKKS 파라미터: N={N}, z_q={z_q}")
+    log_info(f"모델 설정: input_dim={input_dim}, num_classes={num_classes}")
+    log_info("서버가 시작되었습니다. 클라이언트 연결을 기다리는 중...")
     uvicorn.run(app, host="0.0.0.0", port=8000)

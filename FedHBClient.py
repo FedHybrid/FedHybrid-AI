@@ -27,7 +27,7 @@ N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
 SERVER_URL = "http://localhost:8000"
-NUM_ROUNDS = 50
+NUM_ROUNDS = 5
 
 def evaluate_local_accuracy(model, data_loader, device):
     model.eval()
@@ -572,6 +572,8 @@ def main(input_file=None):
         numeric_cols = df_for_prediction.select_dtypes(include=['int64', 'float64']).columns.tolist()
         if 'readmitted' in numeric_cols:
             numeric_cols.remove('readmitted')
+        if 'max_glu_serum' in numeric_cols:
+            numeric_cols.remove('max_glu_serum')
         
         X_pred = df_for_prediction[numeric_cols].values.astype('float32')
         print(f"예측용 데이터 준비: {X_pred.shape}")
