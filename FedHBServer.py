@@ -70,8 +70,8 @@ rescale_q = z_q  # 리스케일링용 스케일
 N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
-# input_dim을 클라이언트와 반드시 동일하게 명시 (클라이언트는 13개 특성 사용)
-input_dim = 13
+# input_dim을 클라이언트와 반드시 동일하게 명시 (클라이언트는 8개 특성 사용)
+input_dim = 8
 num_classes = 2
 
 global_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=num_classes).to(device)

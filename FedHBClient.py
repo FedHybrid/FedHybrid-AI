@@ -428,8 +428,19 @@ def main(input_file=None):
         print(f"📥 1단계: 서버에서 글로벌 모델 다운로드 중...", flush=True)
         try:
             state_dict = download_global_model()
-            global_model.load_state_dict(state_dict)
-            print(f"✅ 글로벌 모델 다운로드 및 로드 성공", flush=True)
+            
+            # 서버 모델과 클라이언트 모델의 차원이 다른 경우 처리
+            try:
+                global_model.load_state_dict(state_dict)
+                print(f"✅ 글로벌 모델 다운로드 및 로드 성공", flush=True)
+            except RuntimeError as e:
+                if "size mismatch" in str(e):
+                    print(f"❌ 모델 차원 불일치: {e}", flush=True)
+                    print("🔄 로컬 모델 초기화로 진행합니다.", flush=True)
+                    # 글로벌 모델을 클라이언트 모델과 동일하게 초기화
+                    global_model.load_state_dict(client_model.state_dict())
+                else:
+                    raise e
         except Exception as e:
             print(f"❌ 글로벌 모델 다운로드/로드 실패: {e}", flush=True)
             print("🔄 로컬 모델 초기화로 진행합니다.", flush=True)
@@ -605,7 +616,7 @@ def main(input_file=None):
             original_df = pd.read_csv('diabetic_data.csv')
             print(f"기본 데이터 파일 사용: {len(original_df)}행, {len(original_df.columns)}열")
         
-        # 예측용 데이터 전처리 (별도로 처리)
+        # 예측용 데이터 전처리 (학습과 동일한 특성 사용)
         df_for_prediction = original_df.copy()
         drop_cols = ['encounter_id', 'patient_nbr']
         if all(col in df_for_prediction.columns for col in drop_cols):
@@ -613,23 +624,44 @@ def main(input_file=None):
         if 'readmitted' in df_for_prediction.columns:
             df_for_prediction['readmitted'] = df_for_prediction['readmitted'].map(lambda x: 0 if x == 'NO' else 1)
         
-        numeric_cols = df_for_prediction.select_dtypes(include=['int64', 'float64']).columns.tolist()
-        if 'readmitted' in numeric_cols:
-            numeric_cols.remove('readmitted')
-        if 'max_glu_serum' in numeric_cols:
-            numeric_cols.remove('max_glu_serum')
+        # 학습과 동일한 특성 선택 (8개 고정 특성)
+        fixed_features = [
+            'admission_source_id', 'time_in_hospital', 'num_procedures', 
+            'num_medications', 'number_outpatient', 'number_emergency', 
+            'number_inpatient', 'number_diagnoses'
+        ]
         
-        X_pred = df_for_prediction[numeric_cols].values.astype('float32')
+        # 사용 가능한 특성만 선택
+        available_features = [col for col in fixed_features if col in df_for_prediction.columns]
+        
+        # 부족한 경우 다른 숫자형 특성 추가
+        if len(available_features) < 8:
+            numeric_cols = df_for_prediction.select_dtypes(include=['int64', 'float64']).columns.tolist()
+            numeric_cols = [col for col in numeric_cols if col != 'readmitted']
+            remaining_cols = [col for col in numeric_cols if col not in available_features]
+            available_features.extend(remaining_cols[:8-len(available_features)])
+        
+        # 정확히 8개 특성만 사용
+        selected_features_for_prediction = available_features[:8]
+        
+        # 선택된 특성으로 데이터 준비
+        X_pred = df_for_prediction[selected_features_for_prediction].values.astype('float32')
         print(f"예측용 데이터 준비: {X_pred.shape}")
+        print(f"예측에 사용되는 특성: {selected_features_for_prediction}")
         
-        # 예측에 사용되는 특성 이름만 추출
-        feature_names_for_prediction = numeric_cols
-        print(f"예측에 사용되는 특성: {feature_names_for_prediction}")
+        # 스케일링 적용 (학습과 동일한 방식)
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        X_pred_scaled = scaler.fit_transform(X_pred)
+        X_pred_scaled = np.nan_to_num(X_pred_scaled, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        # 예측 수행
+        print(f"스케일링 후 데이터 형태: {X_pred_scaled.shape}")
+        print(f"스케일링 후 NaN 개수: {np.isnan(X_pred_scaled).sum()}")
+        
+        # 예측 수행 (스케일링된 데이터 사용)
         probabilities, predictions, feature_importance = predict_diabetes_probability_with_explanation(client_model, 
-            DataLoader(list(zip(X_pred, [0]*len(X_pred))), batch_size=64, shuffle=False), 
-            feature_names_for_prediction, device)
+            DataLoader(list(zip(X_pred_scaled, [0]*len(X_pred_scaled))), batch_size=64, shuffle=False), 
+            selected_features_for_prediction, device)
         
         # 원본 데이터에 예측 결과 추가 (원본 형식 유지)
         result_df = original_df.copy()
