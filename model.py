@@ -18,19 +18,122 @@ class DiabetesDataset(Dataset):
         return torch.tensor(self.X[idx]), torch.tensor(self.y[idx])
 
 def load_diabetes_data(csv_path, test_size=0.2, random_state=42):
+    print(f"데이터 로드 시작: {csv_path}", flush=True)
     df = pd.read_csv(csv_path)
+    print(f"원본 데이터 크기: {df.shape}", flush=True)
+    
+    # 기본 전처리
     drop_cols = ['encounter_id', 'patient_nbr']
-    df = df.drop(columns=drop_cols)
-    df['readmitted'] = df['readmitted'].map(lambda x: 0 if x == 'NO' else 1)
+    available_drop_cols = [col for col in drop_cols if col in df.columns]
+    if available_drop_cols:
+        df = df.drop(columns=available_drop_cols)
+        print(f"제거된 컬럼: {available_drop_cols}", flush=True)
+    
+    # readmitted 컬럼 처리
+    if 'readmitted' in df.columns:
+        df['readmitted'] = df['readmitted'].map(lambda x: 0 if x == 'NO' else 1)
+    
     # 숫자형 컬럼만 feature로 사용
     numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
-    numeric_cols = [col for col in numeric_cols if col != 'readmitted']
+    if 'readmitted' in numeric_cols:
+        numeric_cols.remove('readmitted')
+    if 'max_glu_serum' in numeric_cols:
+        numeric_cols.remove('max_glu_serum')  # 문제가 되는 컬럼 제거
+    
+    print(f"사용할 특성 컬럼 ({len(numeric_cols)}개): {numeric_cols[:5]}...", flush=True)
+    
+    # 특성 데이터 추출
     X = df[numeric_cols].values
-    y = df['readmitted'].values
+    y = df['readmitted'].values if 'readmitted' in df.columns else np.zeros(len(df))
+    
+    print(f"특성 데이터 형태: {X.shape}, 레이블 형태: {y.shape}", flush=True)
+    
+    # 데이터 품질 검사 및 정리
+    print("데이터 품질 검사 중...", flush=True)
+    
+    # 1. NaN 값 처리
+    nan_mask = np.isnan(X)
+    if nan_mask.any():
+        print(f"NaN 값 발견: {nan_mask.sum()}개", flush=True)
+        # 각 컬럼의 중앙값으로 NaN 대체
+        for col_idx in range(X.shape[1]):
+            col_data = X[:, col_idx]
+            if np.isnan(col_data).any():
+                median_val = np.nanmedian(col_data)
+                X[nan_mask[:, col_idx], col_idx] = median_val
+                print(f"컬럼 {col_idx} NaN 값을 {median_val}로 대체", flush=True)
+    
+    # 2. 무한대 값 처리
+    inf_mask = np.isinf(X)
+    if inf_mask.any():
+        print(f"무한대 값 발견: {inf_mask.sum()}개", flush=True)
+        # 무한대 값을 해당 컬럼의 최대/최소 유한값으로 대체
+        for col_idx in range(X.shape[1]):
+            col_data = X[:, col_idx]
+            if np.isinf(col_data).any():
+                finite_values = col_data[np.isfinite(col_data)]
+                if len(finite_values) > 0:
+                    max_finite = np.max(finite_values)
+                    min_finite = np.min(finite_values)
+                    X[X[:, col_idx] == np.inf, col_idx] = max_finite
+                    X[X[:, col_idx] == -np.inf, col_idx] = min_finite
+                    print(f"컬럼 {col_idx} 무한대 값을 {min_finite}~{max_finite} 범위로 대체", flush=True)
+    
+    # 3. 극값 처리 (IQR 방법)
+    print("극값 처리 중...", flush=True)
+    for col_idx in range(X.shape[1]):
+        col_data = X[:, col_idx]
+        q25, q75 = np.percentile(col_data, [25, 75])
+        iqr = q75 - q25
+        lower_bound = q25 - 3 * iqr  # 3 IQR로 완화
+        upper_bound = q75 + 3 * iqr
+        
+        outlier_mask = (col_data < lower_bound) | (col_data > upper_bound)
+        if outlier_mask.any():
+            X[col_data < lower_bound, col_idx] = lower_bound
+            X[col_data > upper_bound, col_idx] = upper_bound
+            print(f"컬럼 {col_idx}: {outlier_mask.sum()}개 극값을 [{lower_bound:.2f}, {upper_bound:.2f}] 범위로 클리핑", flush=True)
+    
+    # 4. 정규화 (StandardScaler 대신 간단한 Min-Max 정규화)
+    print("데이터 정규화 중...", flush=True)
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # 정규화 후에도 NaN/Inf 체크
+    if np.isnan(X_scaled).any() or np.isinf(X_scaled).any():
+        print("경고: 정규화 후에도 NaN/Inf 값이 존재합니다. Min-Max 스케일링으로 변경합니다.", flush=True)
+        from sklearn.preprocessing import MinMaxScaler
+        minmax_scaler = MinMaxScaler()
+        X_scaled = minmax_scaler.fit_transform(X)
+        
+        # 여전히 문제가 있다면 수동으로 처리
+        if np.isnan(X_scaled).any() or np.isinf(X_scaled).any():
+            print("수동 정규화 수행 중...", flush=True)
+            for col_idx in range(X.shape[1]):
+                col_data = X[:, col_idx]
+                col_min, col_max = np.min(col_data), np.max(col_data)
+                if col_max - col_min > 0:
+                    X_scaled[:, col_idx] = (col_data - col_min) / (col_max - col_min)
+                else:
+                    X_scaled[:, col_idx] = 0.5  # 모든 값이 동일한 경우
+    
+    # 최종 데이터 품질 확인
+    print(f"최종 데이터 통계:", flush=True)
+    print(f"  X 범위: [{np.min(X_scaled):.4f}, {np.max(X_scaled):.4f}]", flush=True)
+    print(f"  X 평균: {np.mean(X_scaled):.4f}, 표준편차: {np.std(X_scaled):.4f}", flush=True)
+    print(f"  NaN 개수: {np.isnan(X_scaled).sum()}", flush=True)
+    print(f"  Inf 개수: {np.isinf(X_scaled).sum()}", flush=True)
+    print(f"  레이블 분포: {np.bincount(y)}", flush=True)
+    
+    # 데이터셋 분할
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y)
+        X_scaled, y, test_size=test_size, random_state=random_state, stratify=y)
+    
     train_dataset = DiabetesDataset(X_train, y_train)
     test_dataset = DiabetesDataset(X_test, y_test)
+    
+    print(f"학습 데이터: {len(train_dataset)}개, 테스트 데이터: {len(test_dataset)}개", flush=True)
     return train_dataset, test_dataset
 
 # EnhancerModel 정의 (서버/클라이언트 공통)
@@ -426,12 +529,12 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
                 torch.nn.init.zeros_(param)
     
     client_model.train()
-    optimizer = optim.Adam(client_model.parameters(), lr=0.003, weight_decay=1e-4)  # 학습률 증가 (속도 향상)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.9)  # 더 자주 스케줄링
+    optimizer = optim.Adam(client_model.parameters(), lr=0.001, weight_decay=1e-5)  # 학습률 감소 (안정성 향상)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)  # 더 보수적인 스케줄링
     total_loss = 0.0
     total_samples = 0
-    mu = 0.01  # FedProx 파라미터 감소 (안정성 향상)
-    epochs = 3  # 에포크 수 더 감소 (속도 향상)
+    mu = 0.001  # FedProx 파라미터 더 감소 (안정성 향상)
+    epochs = 5  # 에포크 수 복원 (안정성 향상)
     
     # Early stopping 변수
     best_loss = float('inf')
@@ -465,20 +568,51 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
             
             loss.backward()
             
-            # NaN 체크
+            # NaN/Inf 체크 (더 상세히)
             if torch.isnan(loss).any() or torch.isinf(loss).any():
-                print(f"  경고: NaN/Inf 손실 감지, 배치 건너뛰기")
+                print(f"  경고: NaN/Inf 손실 감지 (loss: {loss.item()}), 배치 건너뛰기", flush=True)
+                optimizer.zero_grad()  # 그래디언트 초기화
+                continue
+            
+            # 그래디언트 NaN/Inf 체크
+            has_nan_grad = False
+            for name, param in client_model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        print(f"  경고: {name}에서 NaN/Inf 그래디언트 감지", flush=True)
+                        has_nan_grad = True
+                        break
+            
+            if has_nan_grad:
+                print(f"  경고: NaN/Inf 그래디언트 감지, 배치 건너뛰기", flush=True)
+                optimizer.zero_grad()
                 continue
             
             # 그래디언트 클리핑 강화
-            torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=0.5)
+            grad_norm = torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=0.1)
+            if grad_norm > 10.0:  # 그래디언트 노름이 너무 큰 경우
+                print(f"  경고: 큰 그래디언트 노름 감지 ({grad_norm:.2f}), 배치 건너뛰기", flush=True)
+                optimizer.zero_grad()
+                continue
             
             optimizer.step()
+            
+            # 모델 파라미터 NaN/Inf 체크 (업데이트 후)
+            has_nan_params = False
+            for name, param in client_model.named_parameters():
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    print(f"  경고: {name}에서 NaN/Inf 파라미터 감지", flush=True)
+                    has_nan_params = True
+                    break
+            
+            if has_nan_params:
+                print(f"  경고: 모델 파라미터에 NaN/Inf 감지, 학습 중단", flush=True)
+                break
+            
             epoch_loss += loss.item() * x.size(0)
             total_samples += x.size(0)
         
-        # 학습률 스케줄링 (optimizer.step() 이후에 호출)
-        scheduler.step()
+        # 학습률 스케줄링은 에포크 끝에서 수행
         
         # Early stopping 체크
         if total_samples > 0:
@@ -499,6 +633,9 @@ def client_update_full(client_model, global_model, data_loader, criterion, round
         if patience_counter >= patience:
             print(f"  Early stopping at epoch {epoch} (loss: {avg_epoch_loss:.4f})")
             break
+        
+        # 학습률 스케줄링 (에포크 끝에서)
+        scheduler.step()
         
         # 에포크별 손실 출력 (디버깅용)
         if epoch % 5 == 0:

@@ -16,6 +16,7 @@ import time
 from typing import Dict, List, Optional
 import sys
 from datetime import datetime
+import shutil
 
 # 로그 출력 개선을 위한 설정
 def log_message(level: str, message: str):
@@ -91,12 +92,49 @@ ROUND_CONFIG = {
     "adaptive_timeout": True  # 적응형 타임아웃 사용
 }
 
-# 서버 시작 시 global_model.pth가 있으면 로드, 없으면 저장
+# 서버 시작 시 global_model.pth가 있으면 로드, 없으면 저장 (호환성 체크 포함)
 if os.path.exists("global_model.pth"):
-    global_model.load_state_dict(torch.load("global_model.pth", map_location=device, weights_only=False))
-    log_success("기존 글로벌 모델 로드 완료")
+    try:
+        model_data = torch.load("global_model.pth", map_location=device, weights_only=False)
+        
+        # 새 형식 (메타데이터 포함)인지 확인
+        if isinstance(model_data, dict) and 'state_dict' in model_data:
+            log_info(f"모델 메타데이터: {model_data.get('model_type', 'Unknown')} v{model_data.get('version', 'Unknown')}")
+            log_info(f"입력 차원: {model_data.get('input_dim', 'Unknown')}")
+            global_model.load_state_dict(model_data['state_dict'])
+        else:
+            # 구 형식 (state_dict만)
+            log_warning("구 형식의 모델 파일입니다. 호환성을 위해 로드를 시도합니다.")
+            global_model.load_state_dict(model_data)
+        
+        log_success("기존 글로벌 모델 로드 완료")
+    except (RuntimeError, KeyError) as e:
+        log_warning(f"기존 모델과 호환되지 않습니다: {str(e)[:100]}...")
+        log_info("기존 모델 파일을 백업하고 새 모델로 초기화합니다")
+        
+        # 기존 파일 백업
+        backup_name = f"global_model_backup_{int(time.time())}.pth"
+        import shutil
+        shutil.move("global_model.pth", backup_name)
+        log_info(f"기존 모델을 {backup_name}으로 백업했습니다")
+        
+        # 새 모델과 메타데이터 저장
+        model_data = {
+            'state_dict': global_model.state_dict(),
+            'input_dim': 8,  # 고정된 입력 차원
+            'model_type': 'ImprovedEnhancerModel',
+            'version': '1.0'
+        }
+        torch.save(model_data, "global_model.pth")
+        log_success("새 글로벌 모델 생성 및 저장 완료")
 else:
-    torch.save(global_model.state_dict(), "global_model.pth")
+    model_data = {
+        'state_dict': global_model.state_dict(),
+        'input_dim': 8,  # 고정된 입력 차원
+        'model_type': 'ImprovedEnhancerModel',
+        'version': '1.0'
+    }
+    torch.save(model_data, "global_model.pth")
     log_info("새 글로벌 모델 생성 및 저장 완료")
 
 class UpdateRequest(BaseModel):
@@ -105,6 +143,7 @@ class UpdateRequest(BaseModel):
     original_size: int
     num_samples: int
     loss: float
+    accuracy: float  # 라운드별 정확도 추가
     client_id: str  # 클라이언트 식별자 추가
     round_id: int   # 라운드 식별자 추가
 
@@ -123,7 +162,13 @@ def get_model():
     else:
         # 파일이 없으면 빈 모델을 저장하고 반환
         log_warning("글로벌 모델 파일이 없어 새로 생성")
-        torch.save(global_model.state_dict(), "global_model.pth")
+        model_data = {
+            'state_dict': global_model.state_dict(),
+            'input_dim': 8,  # 고정된 입력 차원
+            'model_type': 'ImprovedEnhancerModel',
+            'version': '1.0'
+        }
+        torch.save(model_data, "global_model.pth")
         return FileResponse("global_model.pth", media_type="application/octet-stream", filename="global_model.pth")
 
 @app.get("/status")
@@ -421,7 +466,13 @@ async def upload_data(file: UploadFile = File(...)):
         # 전역 모델 초기화 (새 데이터로 학습 시작)
         global global_model
         global_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=num_classes).to(device)
-        torch.save(global_model.state_dict(), "global_model.pth")
+        model_data = {
+            'state_dict': global_model.state_dict(),
+            'input_dim': input_dim,
+            'model_type': 'ImprovedEnhancerModel',
+            'version': '1.0'
+        }
+        torch.save(model_data, "global_model.pth")
         print("전역 모델 초기화 완료")
         
         return {
@@ -443,6 +494,8 @@ async def aggregate(request: UpdateRequest):
     log_debug(f"받은 c1_list 길이: {len(request.c1_list)}")
     log_debug(f"원본 크기: {request.original_size}")
     log_debug(f"샘플 수: {request.num_samples}")
+    log_info(f"클라이언트 {request.client_id} 라운드 {request.round_id} 정확도: {request.accuracy:.4f}")
+    log_info(f"클라이언트 {request.client_id} 라운드 {request.round_id} 손실: {request.loss:.4f}")
     
     # 라운드별 버퍼 초기화
     if request.round_id not in updates_buffer:

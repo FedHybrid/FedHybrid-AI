@@ -58,7 +58,18 @@ def download_global_model():
                 print(f"글로벌 모델 다운로드 완료 (파일 크기: {file_size} bytes)")
                 
                 try:
-                    state_dict = torch.load("global_model.pth", map_location=device, weights_only=False)
+                    model_data = torch.load("global_model.pth", map_location=device, weights_only=False)
+                    
+                    # 새 형식 (메타데이터 포함)인지 확인
+                    if isinstance(model_data, dict) and 'state_dict' in model_data:
+                        print(f"모델 메타데이터: {model_data.get('model_type', 'Unknown')} v{model_data.get('version', 'Unknown')}")
+                        print(f"서버 모델 입력 차원: {model_data.get('input_dim', 'Unknown')}")
+                        state_dict = model_data['state_dict']
+                    else:
+                        # 구 형식 (state_dict만)
+                        print("구 형식의 모델 파일입니다.")
+                        state_dict = model_data
+                    
                     os.remove("global_model.pth")
                     print("글로벌 모델 로드 성공")
                     return state_dict
@@ -301,10 +312,33 @@ def predict_diabetes_probability_with_explanation(model, data_loader, feature_na
     return probabilities, predictions, feature_importance
 
 def save_results_to_excel(original_data, probabilities, predictions, feature_importance=None, output_path='prediction_results.xlsx'):
-    """결과를 엑셀 파일로 저장"""
+    """결과를 엑셀 파일로 저장 (간소화 버전)"""
     try:
+        print(f"결과 저장 시작: {len(probabilities)}개 데이터", flush=True)
+        
+        # NaN 값 처리
+        probabilities = np.nan_to_num(probabilities, nan=0.0, posinf=1.0, neginf=0.0)
+        predictions = np.nan_to_num(predictions, nan=0, posinf=1, neginf=0).astype(int)
+        
+        # 데이터 크기 제한 (메모리 및 시간 절약)
+        max_rows = 10000  # 최대 10,000행으로 제한
+        if len(original_data) > max_rows:
+            print(f"데이터 크기가 큽니다. 상위 {max_rows}개 행만 저장합니다.", flush=True)
+            # 확률 기준으로 상위 데이터만 선택
+            top_indices = np.argsort(probabilities)[-max_rows:]
+            original_data = original_data.iloc[top_indices]
+            probabilities = probabilities[top_indices]
+            predictions = predictions[top_indices]
+        
         # 원본 데이터에 예측 결과 추가
         result_df = original_data.copy()
+        
+        # 불필요한 Unnamed 컬럼들 제거 (Unnamed:50, Unnamed:51, Unnamed:52 등)
+        unnamed_cols = [col for col in result_df.columns if col.startswith('Unnamed:')]
+        if unnamed_cols:
+            print(f"불필요한 컬럼 제거: {unnamed_cols}", flush=True)
+            result_df = result_df.drop(columns=unnamed_cols)
+        
         result_df['당뇨병_확률'] = probabilities
         result_df['예측_결과'] = predictions
         result_df['예측_라벨'] = ['당뇨병' if p == 1 else '정상' for p in predictions]
@@ -312,92 +346,28 @@ def save_results_to_excel(original_data, probabilities, predictions, feature_imp
         # 확률별로 정렬
         result_df = result_df.sort_values('당뇨병_확률', ascending=False)
         
-        # 엑셀 파일로 저장 (openpyxl 엔진 사용)
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # 메인 결과 시트 (원본 데이터 + 예측 결과)
-            result_df.to_excel(writer, sheet_name='예측결과', index=False)
-            
-            # 요약 통계 시트 추가
-            summary_data = {
-                '항목': ['총 데이터 수', '당뇨병 예측 수', '정상 예측 수', '평균 당뇨병 확률'],
-                '값': [
-                    len(result_df),
-                    sum(predictions),
-                    len(predictions) - sum(predictions),
-                    f"{np.mean(probabilities):.4f}"
-                ]
-            }
-            summary_df = pd.DataFrame(summary_data)
-            summary_df.to_excel(writer, sheet_name='요약통계', index=False)
-            
-            # 특성 중요도 시트 추가
-            if feature_importance:
-                importance_data = []
-                for feature, importance in sorted(feature_importance.items(), key=lambda x: x[1], reverse=True):
-                    importance_data.append({
-                        '특성명': feature,
-                        '중요도': importance,
-                        '중요도_순위': len(importance_data) + 1
-                    })
-                importance_df = pd.DataFrame(importance_data)
-                importance_df.to_excel(writer, sheet_name='특성중요도', index=False)
-            
-            # 확률 구간별 분포
-            prob_ranges = [
-                (0.0, 0.2, '매우 낮음'),
-                (0.2, 0.4, '낮음'),
-                (0.4, 0.6, '보통'),
-                (0.6, 0.8, '높음'),
-                (0.8, 1.0, '매우 높음')
-            ]
-            
-            range_data = []
-            for low, high, label in prob_ranges:
-                count = sum((probabilities >= low) & (probabilities < high))
-                range_data.append({
-                    '확률_구간': f"{low:.1f}-{high:.1f}",
-                    '라벨': label,
-                    '데이터_수': count,
-                    '비율': f"{count/len(probabilities)*100:.1f}%"
-                })
-            
-            range_df = pd.DataFrame(range_data)
-            range_df.to_excel(writer, sheet_name='확률구간별분포', index=False)
-            
-            # 상세 분석 시트 추가
-            detail_data = []
-            for i, (prob, pred) in enumerate(zip(probabilities, predictions)):
-                risk_level = '매우 높음' if prob >= 0.8 else \
-                           '높음' if prob >= 0.6 else \
-                           '보통' if prob >= 0.4 else \
-                           '낮음' if prob >= 0.2 else '매우 낮음'
-                
-                detail_data.append({
-                    '환자_번호': i + 1,
-                    '당뇨병_확률': f"{prob:.4f}",
-                    '예측_결과': '당뇨병' if pred == 1 else '정상',
-                    '위험도': risk_level,
-                    '권장사항': '즉시 의료진 상담 권장' if prob >= 0.8 else \
-                              '정기 검진 권장' if prob >= 0.6 else \
-                              '생활습관 개선 권장' if prob >= 0.4 else \
-                              '건강 관리 권장' if prob >= 0.2 else '정상 관리'
-                })
-            
-            detail_df = pd.DataFrame(detail_data)
-            detail_df.to_excel(writer, sheet_name='상세분석', index=False)
+        print(f"엑셀 파일 저장 시작: {len(result_df)}행", flush=True)
         
-        print(f"결과가 {output_path}에 저장되었습니다.")
-        print(f"총 {len(result_df)}개 데이터에 대한 예측 완료")
-        print(f"당뇨병 예측: {sum(predictions)}개")
-        print(f"정상 예측: {len(predictions) - sum(predictions)}개")
-        print(f"평균 당뇨병 확률: {np.mean(probabilities):.4f}")
-        print(f"엑셀 파일 크기: {os.path.getsize(output_path)} bytes")
+        # 간단한 엑셀 저장 (시트 하나만)
+        try:
+            result_df.to_excel(output_path, index=False, engine='openpyxl')
+            print(f"엑셀 파일 저장 완료: {output_path}", flush=True)
+        except Exception as excel_error:
+            print(f"엑셀 저장 실패, CSV로 대체 저장: {excel_error}", flush=True)
+            csv_path = output_path.replace('.xlsx', '.csv')
+            result_df.to_csv(csv_path, index=False)
+            print(f"CSV 파일 저장 완료: {csv_path}", flush=True)
+            return True
         
-        if feature_importance:
-            print(f"특성 중요도 분석 완료 - 상위 3개 특성:")
-            sorted_importance = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
-            for i, (feature, importance) in enumerate(sorted_importance[:3]):
-                print(f"  {i+1}. {feature}: {importance:.4f}")
+        # 기본 통계 출력
+        print(f"결과가 {output_path}에 저장되었습니다.", flush=True)
+        print(f"총 {len(result_df)}개 데이터에 대한 예측 완료", flush=True)
+        print(f"당뇨병 예측: {sum(predictions)}개", flush=True)
+        print(f"정상 예측: {len(predictions) - sum(predictions)}개", flush=True)
+        print(f"평균 당뇨병 확률: {np.mean(probabilities):.4f}", flush=True)
+        
+        if os.path.exists(output_path):
+            print(f"파일 크기: {os.path.getsize(output_path)} bytes", flush=True)
         
         return True
         
@@ -409,43 +379,62 @@ def save_results_to_excel(original_data, probabilities, predictions, feature_imp
 
 def main(input_file=None):
     """메인 실행 함수"""
-    print("=== FedHybrid 클라이언트 시작 ===")
+    print("=== FedHybrid 클라이언트 시작 ===", flush=True)
     
     # 입력 파일 처리
     if input_file and os.path.exists(input_file):
-        print(f"입력 파일: {input_file}")
+        print(f"입력 파일: {input_file}", flush=True)
         data_file = input_file
     else:
-        print("기본 데이터 파일 사용: diabetic_data.csv")
+        print("기본 데이터 파일 사용: diabetic_data.csv", flush=True)
         data_file = 'diabetic_data.csv'
     
-    # 데이터셋 준비 (train/test 분할)
+    # 데이터셋 준비 (개선된 버전 사용)
     try:
-        train_dataset, test_dataset = load_diabetes_data(data_file)
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=0)
-        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=0)
+        from improved_model import load_improved_diabetes_data
+        train_dataset, test_dataset, class_weights, selected_features = load_improved_diabetes_data(data_file)
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
+        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0)
         input_dim = train_dataset.X.shape[1]
-        print(f"데이터 로드 완료 - 입력 차원: {input_dim}")
+        print(f"개선된 데이터 로드 완료 - 입력 차원: {input_dim}", flush=True)
+        print(f"선택된 특성: {selected_features}", flush=True)
+        print(f"클래스 가중치: {class_weights}", flush=True)
     except Exception as e:
-        print(f"데이터 로드 실패: {e}")
-        return False
+        print(f"개선된 데이터 로드 실패, 기본 버전 사용: {e}", flush=True)
+        try:
+            train_dataset, test_dataset = load_diabetes_data(data_file)
+            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
+            test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0)
+            input_dim = train_dataset.X.shape[1]
+            class_weights = None
+            selected_features = None
+            print(f"기본 데이터 로드 완료 - 입력 차원: {input_dim}", flush=True)
+        except Exception as e2:
+            print(f"데이터 로드 완전 실패: {e2}", flush=True)
+            return False
 
     # 모델 준비 (EnhancerModel)
     client_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=2).to(device)
     global_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=2).to(device)  # 글로벌 모델 추가
 
-    print(f"=== {NUM_ROUNDS}라운드 학습 시작 ===")
+    print(f"=== {NUM_ROUNDS}라운드 학습 시작 ===", flush=True)
     
     for r in range(NUM_ROUNDS):
         round_start_time = time.time()  # 라운드 시작 시간
-        print(f"=== 라운드 {r+1} 시작 ===")
+        print(f"\n🚀 === 라운드 {r+1}/{NUM_ROUNDS} 시작 ===", flush=True)
+        print(f"⏰ 시작 시간: {time.strftime('%H:%M:%S')}", flush=True)
         
+        # 1단계: 글로벌 모델 다운로드
+        print(f"📥 1단계: 서버에서 글로벌 모델 다운로드 중...", flush=True)
         try:
             state_dict = download_global_model()
             global_model.load_state_dict(state_dict)
+            print(f"✅ 글로벌 모델 다운로드 및 로드 성공", flush=True)
         except Exception as e:
-            print(f"글로벌 모델 다운로드 실패: {e}")
-            print("로컬 학습만 진행합니다.")
+            print(f"❌ 글로벌 모델 다운로드/로드 실패: {e}", flush=True)
+            print("🔄 로컬 모델 초기화로 진행합니다.", flush=True)
+            # 글로벌 모델을 클라이언트 모델과 동일하게 초기화
+            global_model.load_state_dict(client_model.state_dict())
         
         acc_before = evaluate_local_accuracy(client_model, train_loader, device)
         
@@ -454,12 +443,27 @@ def main(input_file=None):
         print(f"  - 모델 파라미터 수: {sum(p.numel() for p in client_model.parameters())}")
         print(f"  - 첫 번째 레이어 가중치 범위: {client_model.feature_extractor[0].weight.min().item():.4f} ~ {client_model.feature_extractor[0].weight.max().item():.4f}")
         
-        # 로컬 학습 수행
+        # 2단계: 로컬 학습 수행
+        print(f"🎓 2단계: 로컬 모델 학습 시작...", flush=True)
         training_start_time = time.time()
-        updated_model, avg_loss, epochs, num_samples = client_update_full(
-            client_model, global_model, train_loader, nn.CrossEntropyLoss(), r, device,
-            use_kd=True, use_fedprox=True, use_pruning=False  # FedProx와 KD 활성화
-        )
+        accuracy = 0.0  # 기본값
+        try:
+            from improved_model import improved_client_update
+            updated_model, avg_loss, epochs, num_samples, accuracy = improved_client_update(
+                client_model, global_model, train_loader, nn.CrossEntropyLoss(), r, device, class_weights
+            )
+            print(f"✅ 개선된 학습 함수 사용 완료", flush=True)
+        except Exception as e:
+            print(f"개선된 학습 실패, 기본 버전 사용: {e}", flush=True)
+            result = client_update_full(
+                client_model, global_model, train_loader, nn.CrossEntropyLoss(), r, device,
+                use_kd=False, use_fedprox=False, use_pruning=False  # 안정성을 위해 모든 고급 기능 비활성화
+            )
+            if len(result) == 4:
+                updated_model, avg_loss, epochs, num_samples = result
+                accuracy = 0.0  # 기본 함수는 정확도를 반환하지 않음
+            else:
+                updated_model, avg_loss, epochs, num_samples, accuracy = result
         training_end_time = time.time()
         training_duration = training_end_time - training_start_time
         acc_after = evaluate_local_accuracy(updated_model, train_loader, device)
@@ -476,65 +480,105 @@ def main(input_file=None):
         # 학습된 모델을 클라이언트 모델에 복사
         client_model.load_state_dict(updated_model.state_dict())
         
-        # === 1단계: 클라이언트 데이터를 CKKS로 암호화 ===
+        # === 3단계: 클라이언트 데이터를 CKKS로 암호화 ===
         encryption_start_time = time.time()
-        print(f"\n=== 1단계: 클라이언트 데이터 CKKS 암호화 ===")
+        print(f"\n🔐 3단계: 클라이언트 데이터 CKKS 암호화", flush=True)
         state_dict = client_model.state_dict()
-        print(f"모델 파라미터 수: {len(state_dict)}개 레이어")
+        print(f"📦 모델 파라미터 수: {len(state_dict)}개 레이어", flush=True)
         
         # 1) Tensor → flat numpy vector
         flat = np.concatenate([param.cpu().numpy().flatten() for param in state_dict.values()])
         print(f"평면화된 벡터 크기: {len(flat)}")
         
         # 2) CKKS 암호화
+        print(f"🔒 CKKS 암호화 진행 중...", flush=True)
         c0_list, c1_list = batch_encrypt(flat)
         encrypted_flat = {'c0_list': c0_list, 'c1_list': c1_list}
         encryption_end_time = time.time()
         encryption_duration = encryption_end_time - encryption_start_time
-        print(f"CKKS 암호화 완료 (소요시간: {encryption_duration:.2f}초)")
+        print(f"✅ CKKS 암호화 완료 (소요시간: {encryption_duration:.2f}초)", flush=True)
         
-        # === 2단계: 암호화된 데이터를 서버로 전송 ===
+        # === 4단계: 암호화된 데이터를 서버로 전송 ===
         upload_start_time = time.time()
-        print(f"\n=== 2단계: 암호화된 데이터 서버 전송 ===")
+        print(f"\n📤 4단계: 암호화된 데이터 서버 전송", flush=True)
         
-        # 암호화된 데이터를 JSON으로 직렬화
+        # NaN/Inf 값을 안전한 값으로 변환하는 함수
+        def safe_float(value):
+            if np.isnan(value) or np.isinf(value):
+                return 0.0  # NaN/Inf를 0으로 대체
+            return float(value)
+        
+        def safe_complex_to_float(complex_val):
+            real_part = safe_float(complex_val.real)
+            imag_part = safe_float(complex_val.imag)
+            return [real_part, imag_part]
+        
+        # 암호화된 데이터를 JSON으로 직렬화 (안전한 변환)
         encrypted_data = {
             'client_id': CLIENT_ID,
             'round_id': r + 1,
-            'c0_list': [[[float(c.real), float(c.imag)] for c in c0] for c0 in c0_list],
-            'c1_list': [[[float(c.real), float(c.imag)] for c in c1] for c1 in c1_list],
+            'c0_list': [[safe_complex_to_float(c) for c in c0] for c0 in c0_list],
+            'c1_list': [[safe_complex_to_float(c) for c in c1] for c1 in c1_list],
             'original_size': len(flat),
-            'num_samples': num_samples,
-            'loss': float(avg_loss)
+            'num_samples': int(num_samples),
+            'loss': safe_float(avg_loss),
+            'accuracy': safe_float(accuracy)  # 라운드별 정확도 추가
         }
         
+        print(f"JSON 직렬화 데이터 확인:", flush=True)
+        print(f"  loss: {encrypted_data['loss']}", flush=True)
+        print(f"  accuracy: {encrypted_data['accuracy']}", flush=True)
+        print(f"  num_samples: {encrypted_data['num_samples']}", flush=True)
+        print(f"  c0_list 길이: {len(encrypted_data['c0_list'])}", flush=True)
+        print(f"  c1_list 길이: {len(encrypted_data['c1_list'])}", flush=True)
+        
         try:
-            response = requests.post(f"{SERVER_URL}/aggregate", json=encrypted_data, timeout=30)
+            print(f"🔄 서버로 라운드 {r+1} 데이터 전송 중...", flush=True)
+            response = requests.post(f"{SERVER_URL}/aggregate", json=encrypted_data, timeout=60)
             if response.status_code == 200:
                 upload_end_time = time.time()
                 upload_duration = upload_end_time - upload_start_time
-                print(f"서버 전송 완료 (소요시간: {upload_duration:.2f}초)")
-                print(f"서버 응답: {response.json()}")
+                print(f"✅ 서버 전송 완료 (소요시간: {upload_duration:.2f}초)", flush=True)
+                
+                server_response = response.json()
+                print(f"📋 서버 응답: {server_response}", flush=True)
+                
+                # 서버에서 다음 라운드 진행 허용 여부 확인
+                if server_response.get("status") == "success":
+                    print(f"✅ 라운드 {r+1} 집계 완료, 다음 라운드 진행 가능", flush=True)
+                else:
+                    print(f"⚠️ 서버 집계 중 문제 발생: {server_response.get('message', '알 수 없는 오류')}", flush=True)
+                
+                # 잠시 대기 (서버 처리 시간 확보)
+                if r < NUM_ROUNDS - 1:  # 마지막 라운드가 아닌 경우
+                    print(f"⏳ 다음 라운드 준비를 위해 2초 대기...", flush=True)
+                    time.sleep(2)
+                    
             else:
-                print(f"서버 전송 실패: {response.status_code}")
-                print(f"응답 내용: {response.text}")
+                print(f"❌ 서버 전송 실패: {response.status_code}", flush=True)
+                print(f"응답 내용: {response.text}", flush=True)
         except Exception as e:
-            print(f"서버 통신 오류: {e}")
-            print("로컬 학습만 진행합니다.")
+            print(f"❌ 서버 통신 오류: {e}", flush=True)
+            print("로컬 학습만 진행합니다.", flush=True)
         
         round_end_time = time.time()
         round_duration = round_end_time - round_start_time
-        print(f"=== 라운드 {r+1} 완료 (총 소요시간: {round_duration:.2f}초) ===")
-        print(f"  - 학습 전 정확도: {acc_before:.2f}%")
-        print(f"  - 학습 후 정확도: {acc_after:.2f}%")
-        print(f"  - 평균 손실: {avg_loss:.4f}")
-        print(f"  - 학습 샘플 수: {num_samples}")
-        print()
+        print(f"\n🏁 === 라운드 {r+1}/{NUM_ROUNDS} 완료 (총 소요시간: {round_duration:.2f}초) ===", flush=True)
+        print(f"📊 성과 요약:", flush=True)
+        print(f"  🎯 학습 전 정확도: {acc_before:.2f}%", flush=True)
+        print(f"  🎯 학습 후 정확도: {acc_after:.2f}%", flush=True)
+        print(f"  📉 평균 손실: {avg_loss:.4f}", flush=True)
+        print(f"  📁 학습 샘플 수: {num_samples:,}", flush=True)
+        print(f"⏰ 완료 시간: {time.strftime('%H:%M:%S')}", flush=True)
+        
+        if r < NUM_ROUNDS - 1:
+            print(f"⏳ 다음 라운드 준비 중...", flush=True)
+        print("=" * 60, flush=True)
 
-    print("=== 모든 라운드 완료 ===")
+    print("=== 모든 라운드 완료 ===", flush=True)
     
     # 최종 예측 수행
-    print("=== 최종 예측 수행 ===")
+    print("=== 최종 예측 수행 ===", flush=True)
     
     # 모델 테스트 (디버깅)
     print("=== 모델 테스트 ===")
@@ -599,14 +643,14 @@ def main(input_file=None):
         success = save_results_to_excel(result_df, probabilities, predictions, feature_importance)
         
         if success:
-            print("=== 학습 및 예측 완료 ===")
-            print(f"총 {len(result_df)}개 데이터에 대한 예측 완료")
-            print(f"당뇨병 예측: {sum(predictions)}개")
-            print(f"정상 예측: {len(predictions) - sum(predictions)}개")
-            print(f"평균 당뇨병 확률: {np.mean(probabilities):.4f}")
+            print("=== 학습 및 예측 완료 ===", flush=True)
+            print(f"총 {len(result_df)}개 데이터에 대한 예측 완료", flush=True)
+            print(f"당뇨병 예측: {sum(predictions)}개", flush=True)
+            print(f"정상 예측: {len(predictions) - sum(predictions)}개", flush=True)
+            print(f"평균 당뇨병 확률: {np.mean(probabilities):.4f}", flush=True)
             return True
         else:
-            print("결과 저장 실패")
+            print("결과 저장 실패", flush=True)
             return False
             
     except Exception as e:

@@ -18,8 +18,12 @@ def mod_x4_plus_1(poly):
             result[idx] += poly[i]
     return result
 
-# 정수 계수로 반올림 함수 (정수 기반)
+# 정수 계수로 반올림 함수 (정수 기반) - 복소수 경고 해결
 def round_to_integer(coeffs):
+    # 복소수인 경우 실수부만 사용
+    if np.iscomplexobj(coeffs):
+        coeffs = np.real(coeffs)
+    
     return np.array(
         [round(c) for c in coeffs],
         dtype=np.int64
@@ -190,9 +194,15 @@ def batch_encrypt(m_coeffs, batch_size=4):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, n)
         
-        # 배치 크기에 맞게 패딩
+        # 배치 크기에 맞게 패딩 - NaN/Inf 체크 추가
         batch = np.zeros(batch_size, dtype=np.int64)
-        batch[:end_idx-start_idx] = m_coeffs[start_idx:end_idx]
+        batch_data = m_coeffs[start_idx:end_idx]
+        
+        # NaN/Inf 값을 0으로 대체
+        if np.isnan(batch_data).any() or np.isinf(batch_data).any():
+            batch_data = np.nan_to_num(batch_data, nan=0, posinf=0, neginf=0).astype(np.int64)
+        
+        batch[:end_idx-start_idx] = batch_data
         
         # 정수 기반 암호화
         c0, c1 = encrypt(batch)
