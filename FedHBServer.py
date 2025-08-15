@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import torch
-from improved_model import ImprovedEnhancerModel, load_improved_diabetes_data
+from advanced_model import AdvancedEnhancerModel, load_advanced_diabetes_data
 from aggregation import CommunicationEfficientFedHB
 import uvicorn
 import os
@@ -74,7 +74,25 @@ s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 input_dim = 8
 num_classes = 2
 
-global_model = ImprovedEnhancerModel(input_dim=input_dim, num_classes=num_classes).to(device)
+# 클라이언트와 동일한 하이퍼파라미터 사용
+OPTIMIZED_PARAMS = {
+    'hidden_dims': [256, 128, 64],
+    'dropout_rate': 0.174,
+    'learning_rate': 0.0027,
+    'weight_decay': 7.19e-5,
+    'batch_size': 64,
+    'epochs': 13,
+    'activation': 'relu',
+    'optimizer': 'adamw',
+    'scheduler': 'cosine'
+}
+
+global_model = AdvancedEnhancerModel(
+    input_dim=input_dim, 
+    num_classes=num_classes,
+    hidden_dims=OPTIMIZED_PARAMS['hidden_dims'],
+    dropout_rate=OPTIMIZED_PARAMS['dropout_rate']
+).to(device)
 fed = CommunicationEfficientFedHB()
 
 # 동시성 제어를 위한 변수들
@@ -101,11 +119,33 @@ if os.path.exists("global_model.pth"):
         if isinstance(model_data, dict) and 'state_dict' in model_data:
             log_info(f"모델 메타데이터: {model_data.get('model_type', 'Unknown')} v{model_data.get('version', 'Unknown')}")
             log_info(f"입력 차원: {model_data.get('input_dim', 'Unknown')}")
-            global_model.load_state_dict(model_data['state_dict'])
+            try:
+                global_model.load_state_dict(model_data['state_dict'])
+                log_success("기존 모델 로드 성공")
+            except RuntimeError as e:
+                log_warning(f"기존 모델과 호환되지 않습니다: {str(e)[:100]}...")
+                log_info("새 모델로 초기화합니다")
+                # 새 모델과 메타데이터 저장
+                model_data = {
+                    'state_dict': global_model.state_dict(),
+                    'input_dim': 8,
+                    'model_type': 'AdvancedEnhancerModel',
+                    'version': '2.0'
+                }
+                torch.save(model_data, "global_model.pth")
+                log_success("새 글로벌 모델 생성 및 저장 완료")
         else:
             # 구 형식 (state_dict만)
-            log_warning("구 형식의 모델 파일입니다. 호환성을 위해 로드를 시도합니다.")
-            global_model.load_state_dict(model_data)
+            log_warning("구 형식의 모델 파일입니다. 새 모델로 초기화합니다.")
+            # 새 모델과 메타데이터 저장
+            model_data = {
+                'state_dict': global_model.state_dict(),
+                'input_dim': 8,
+                'model_type': 'AdvancedEnhancerModel',
+                'version': '2.0'
+            }
+            torch.save(model_data, "global_model.pth")
+            log_success("새 글로벌 모델 생성 및 저장 완료")
         
         log_success("기존 글로벌 모델 로드 완료")
     except (RuntimeError, KeyError) as e:
@@ -122,8 +162,8 @@ if os.path.exists("global_model.pth"):
         model_data = {
             'state_dict': global_model.state_dict(),
             'input_dim': 8,  # 고정된 입력 차원
-            'model_type': 'ImprovedEnhancerModel',
-            'version': '1.0'
+            'model_type': 'AdvancedEnhancerModel',
+            'version': '2.0'
         }
         torch.save(model_data, "global_model.pth")
         log_success("새 글로벌 모델 생성 및 저장 완료")
@@ -131,8 +171,8 @@ else:
     model_data = {
         'state_dict': global_model.state_dict(),
         'input_dim': 8,  # 고정된 입력 차원
-        'model_type': 'ImprovedEnhancerModel',
-        'version': '1.0'
+        'model_type': 'AdvancedEnhancerModel',
+        'version': '2.0'
     }
     torch.save(model_data, "global_model.pth")
     log_info("새 글로벌 모델 생성 및 저장 완료")
@@ -170,6 +210,77 @@ def get_model():
         }
         torch.save(model_data, "global_model.pth")
         return FileResponse("global_model.pth", media_type="application/octet-stream", filename="global_model.pth")
+
+@app.post("/upload")
+async def upload_client_update(request: UpdateRequest):
+    """클라이언트 업데이트 수신 및 처리"""
+    try:
+        log_info(f"=== 클라이언트 {request.client_id} 암호화된 데이터 수신 (라운드 {request.round_id}) ===")
+        log_debug(f"받은 c0_list 길이: {len(request.c0_list)}")
+        log_debug(f"받은 c1_list 길이: {len(request.c1_list)}")
+        log_debug(f"원본 크기: {request.original_size}")
+        log_debug(f"샘플 수: {request.num_samples}")
+        log_info(f"클라이언트 {request.client_id} 라운드 {request.round_id} 정확도: {request.accuracy}")
+        log_info(f"클라이언트 {request.client_id} 라운드 {request.round_id} 손실: {request.loss}")
+        
+        # 라운드 버퍼 초기화 (필요한 경우)
+        if request.round_id not in updates_buffer:
+            log_info(f"새 라운드 {request.round_id} 버퍼 생성")
+            updates_buffer[request.round_id] = {}
+            round_start_time[request.round_id] = time.time()
+        
+        # 현재 진행 중인 라운드 업데이트
+        global current_round
+        current_round = max(current_round, request.round_id)
+        log_debug(f"현재 진행 중인 라운드: {current_round}")
+        log_debug(f"활성 라운드들: {list(updates_buffer.keys())}")
+        
+        # 암호화된 데이터 변환
+        encrypted_data = []
+        for i in range(len(request.c0_list)):
+            c0 = np.array(request.c0_list[i], dtype=np.complex128)
+            c1 = np.array(request.c1_list[i], dtype=np.complex128)
+            encrypted_data.append((c0, c1))
+        
+        log_debug(f"암호화된 데이터 변환 완료: {len(encrypted_data)}개 배치")
+        if len(encrypted_data) > 0:
+            log_debug(f"첫 번째 배치 c0 범위: {encrypted_data[0][0].min()} ~ {encrypted_data[0][0].max()}")
+            log_debug(f"첫 번째 배치 c1 범위: {encrypted_data[0][1].min()} ~ {encrypted_data[0][1].max()}")
+        
+        # 클라이언트 업데이트 저장
+        updates_buffer[request.round_id][request.client_id] = {
+            'encrypted_data': encrypted_data,
+            'original_size': request.original_size,
+            'num_samples': request.num_samples,
+            'loss': request.loss,
+            'accuracy': request.accuracy
+        }
+        
+        log_success(f"클라이언트 {request.client_id} 업데이트 저장 완료 (라운드 {request.round_id})")
+        log_info(f"라운드 {request.round_id} 버퍼 상태: {len(updates_buffer[request.round_id])}/{ROUND_CONFIG['target_clients']} 클라이언트 (목표)")
+        log_debug(f"라운드 {request.round_id} 대기 중인 클라이언트: {list(updates_buffer[request.round_id].keys())}")
+        
+        # 집계 조건 확인
+        elapsed_time = time.time() - round_start_time[request.round_id]
+        client_count = len(updates_buffer[request.round_id])
+        
+        log_info(f"집계 조건 확인: {client_count}개 클라이언트, {elapsed_time:.1f} 초 경과")
+        
+        # 집계 여부 결정
+        should_aggregate = (
+            client_count >= ROUND_CONFIG["target_clients"] or
+            (elapsed_time > MAX_WAIT_TIME and client_count >= ROUND_CONFIG["min_clients"]) or
+            (elapsed_time > ROUND_TIMEOUT and client_count >= ROUND_CONFIG["min_clients"]) or
+            client_count >= ROUND_CONFIG["max_clients"]
+        )
+        
+        log_info(f"집계 여부: {should_aggregate} ()")
+        
+        return {"status": "success", "message": "업데이트 수신 완료", "should_aggregate": should_aggregate}
+        
+    except Exception as e:
+        log_error(f"클라이언트 업데이트 처리 중 오류: {e}")
+        return {"error": f"업데이트 처리 실패: {str(e)}"}
 
 @app.get("/status")
 def get_status():

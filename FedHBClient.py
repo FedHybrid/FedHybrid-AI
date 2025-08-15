@@ -27,7 +27,7 @@ N = 4  # 슬롯 수
 s = np.array([1+0j, 1+0j, 0+0j, 0+0j], dtype=np.complex128)  # 비밀키
 
 SERVER_URL = "http://localhost:8000"
-NUM_ROUNDS = 5
+NUM_ROUNDS = 50
 
 def evaluate_local_accuracy(model, data_loader, device):
     model.eval()
